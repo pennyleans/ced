@@ -7,9 +7,10 @@ The cint editor: a small, plain terminal text editor written entirely in cint, w
 
 ## Run it
 
-    cint run --frame-arena 67108864 ced.ci -- notes.txt
+    cint build --app --frame-arena 67108864 --out build ced.ci
+    build/ced notes.txt
 
-The first start compiles ced (about 8 s); `cint run` keeps the build, and later starts take about 0.1 s. `--frame-arena` gives ced room for files up to 8 MiB. The keys are on the bottom line.
+Build once, then run with no flag. The frame arena is baked in at build time, so ced takes files up to 8 MiB. The keys are on the bottom line.
 
 ## License
 

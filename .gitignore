@@ -9,6 +9,9 @@ CONTRIBUTING.md
 RELEASING.md
 VERSION
 
+# Built binary from `cint build --app` (see README).
+build/
+
 # Python
 __pycache__/
 *.py[cod]
