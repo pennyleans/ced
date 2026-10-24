@@ -1,0 +1,304 @@
+// cur.ci: moving the caret and the selection (SPEC.md TEXT-3, TEXT-4, KEY-3).
+//
+// A position is a byte offset into the text that never falls inside a UTF-8 sequence. Lines end
+// at LF. A column is what the user sees: one per code point, with a tab advancing to the next
+// multiple of TAB. Up and down keep a goal column, so moving through a short line and on to a
+// long one lands back where the caret started.
+//
+// Every move goes through `go`: the head (the caret) moves; the anchor follows it unless the
+// move extends the selection (Shift).
+
+import state;
+import buf;
+
+const I64 TAB = 4;
+const U8 LF = 10;
+
+// A UTF-8 continuation byte, 10xxxxxx: never the start of a code point.
+Bool cont(U8 b) {
+    return b >= 128 && b < 192;
+}
+
+export I64 next_cp(in I64[_] r, in U8[_] t, I64 p) {
+    I64 n = buf.length(r, t);
+    if (p >= n) {
+        return n;
+    }
+    I64 q = p + 1;
+    while (q < n && cont(buf.at(r, t, q))) {
+        q += 1;
+    }
+    return q;
+}
+
+export I64 prev_cp(in I64[_] r, in U8[_] t, I64 p) {
+    if (p <= 0) {
+        return 0;
+    }
+    I64 q = p - 1;
+    while (q > 0 && cont(buf.at(r, t, q))) {
+        q -= 1;
+    }
+    return q;
+}
+
+export I64 line_start(in I64[_] r, in U8[_] t, I64 p) {
+    I64 q = p;
+    while (q > 0 && buf.at(r, t, q - 1) != LF) {
+        q -= 1;
+    }
+    return q;
+}
+
+export I64 line_end(in I64[_] r, in U8[_] t, I64 p) {
+    I64 n = buf.length(r, t);
+    I64 q = p;
+    while (q < n && buf.at(r, t, q) != LF) {
+        q += 1;
+    }
+    return q;
+}
+
+// The column after the code point at q, when it starts at column c.
+I64 advance(in I64[_] r, in U8[_] t, I64 q, I64 c) {
+    if (buf.at(r, t, q) == 9) {
+        return (c / TAB + 1) * TAB;
+    }
+    return c + 1;
+}
+
+// The column of position p on its line.
+export I64 column(in I64[_] r, in U8[_] t, I64 p) {
+    I64 q = line_start(r, t, p);
+    I64 c = 0;
+    while (q < p) {
+        c = advance(r, t, q, c);
+        q = next_cp(r, t, q);
+    }
+    return c;
+}
+
+// The position on the line starting at ls closest to column `col`, without passing its end.
+export I64 at_column(in I64[_] r, in U8[_] t, I64 ls, I64 col) {
+    I64 e = line_end(r, t, ls);
+    I64 q = ls;
+    I64 c = 0;
+    while (q < e && advance(r, t, q, c) <= col) {
+        c = advance(r, t, q, c);
+        q = next_cp(r, t, q);
+    }
+    return q;
+}
+
+// Moves the head to p; the anchor follows unless `extend`. Every move but up and down also sets
+// R_GOAL to -1, forgetting the goal column.
+export void go(inout I64[_] r, I64 p, Bool extend) {
+    r[state.R_HEAD] = p;
+    if (!extend) {
+        r[state.R_ANCHOR] = p;
+    }
+}
+
+export void left(inout I64[_] r, in U8[_] t, Bool extend) {
+    I64 h = r[state.R_HEAD];
+    I64 a = r[state.R_ANCHOR];
+    r[state.R_GOAL] = -1;
+    if (!extend && a != h) {
+        go(r, min(a, h), false);       // a plain Left collapses a selection to its start
+        return;
+    }
+    go(r, prev_cp(r, t, h), extend);
+}
+
+export void right(inout I64[_] r, in U8[_] t, Bool extend) {
+    I64 h = r[state.R_HEAD];
+    I64 a = r[state.R_ANCHOR];
+    r[state.R_GOAL] = -1;
+    if (!extend && a != h) {
+        go(r, max(a, h), false);
+        return;
+    }
+    go(r, next_cp(r, t, h), extend);
+}
+
+export void home(inout I64[_] r, in U8[_] t, Bool extend) {
+    r[state.R_GOAL] = -1;
+    go(r, line_start(r, t, r[state.R_HEAD]), extend);
+}
+
+export void end(inout I64[_] r, in U8[_] t, Bool extend) {
+    r[state.R_GOAL] = -1;
+    go(r, line_end(r, t, r[state.R_HEAD]), extend);
+}
+
+export void doc_start(inout I64[_] r, Bool extend) {
+    r[state.R_GOAL] = -1;
+    go(r, 0, extend);
+}
+
+export void doc_end(inout I64[_] r, in U8[_] t, Bool extend) {
+    r[state.R_GOAL] = -1;
+    go(r, buf.length(r, t), extend);
+}
+
+// Moves `lines` lines up (negative) or down (positive), aiming for the goal column. At the first
+// or last line the caret goes to the start or end of the text, as most editors do.
+export void vertical(inout I64[_] r, in U8[_] t, I64 lines, Bool extend) {
+    I64 h = r[state.R_HEAD];
+    if (r[state.R_GOAL] < 0) {
+        r[state.R_GOAL] = column(r, t, h);
+    }
+    I64 ls = line_start(r, t, h);
+    I64 k = lines;
+    while (k < 0) {
+        if (ls == 0) {
+            go(r, 0, extend);
+            return;
+        }
+        ls = line_start(r, t, ls - 1);
+        k += 1;
+    }
+    while (k > 0) {
+        I64 e = line_end(r, t, ls);
+        if (e == buf.length(r, t)) {
+            go(r, e, extend);
+            return;
+        }
+        ls = e + 1;
+        k -= 1;
+    }
+    go(r, at_column(r, t, ls, r[state.R_GOAL]), extend);
+}
+
+// Letters, digits, `_`, and any non-ASCII byte count as word characters.
+Bool word(U8 b) {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b >= 128;
+}
+
+// Ctrl+Right: over any non-word characters, then over a word.
+export void word_right(inout I64[_] r, in U8[_] t, Bool extend) {
+    I64 n = buf.length(r, t);
+    I64 q = r[state.R_HEAD];
+    while (q < n && !word(buf.at(r, t, q))) {
+        q += 1;
+    }
+    while (q < n && word(buf.at(r, t, q))) {
+        q += 1;
+    }
+    r[state.R_GOAL] = -1;
+    go(r, q, extend);
+}
+
+// Ctrl+Left: back over any non-word characters, then over a word.
+export void word_left(inout I64[_] r, in U8[_] t, Bool extend) {
+    I64 q = r[state.R_HEAD];
+    while (q > 0 && !word(buf.at(r, t, q - 1))) {
+        q -= 1;
+    }
+    while (q > 0 && word(buf.at(r, t, q - 1))) {
+        q -= 1;
+    }
+    r[state.R_GOAL] = -1;
+    go(r, q, extend);
+}
+
+// Tests: "ab\n" "hello\n" "x" with the caret at the start.
+void load(inout I64[_] r, inout U8[_] t) {
+    U8[10] s = b"ab\nhello\nx";
+    buf.reset(r, t);
+    assert(buf.insert(r, t, 0, s));
+    r[state.R_GOAL] = -1;
+    go(r, 0, false);
+}
+
+test "left and right step over whole code points" {
+    I64[64] r;
+    U8[16] t;
+    buf.reset(r, t);
+    U8[4] s = b"a\xc3\xa9b";    // "aéb": é is two bytes
+    assert(buf.insert(r, t, 0, s));
+    go(r, 0, false);
+    right(r, t, false);
+    assert(r[state.R_HEAD] == 1);
+    right(r, t, false);
+    assert(r[state.R_HEAD] == 3);
+    left(r, t, false);
+    assert(r[state.R_HEAD] == 1);
+}
+
+test "down keeps the goal column across a short line" {
+    I64[64] r;
+    U8[16] t;
+    load(r, t);
+    go(r, 4, false);                   // "h|ello", column 1 of line 2
+    vertical(r, t, -1, false);
+    assert(r[state.R_HEAD] == 1);      // "a|b"
+    vertical(r, t, 1, false);
+    assert(r[state.R_HEAD] == 4);
+    go(r, 7, false);                   // "hell|o", column 4
+    r[state.R_GOAL] = -1;
+    vertical(r, t, -1, false);
+    assert(r[state.R_HEAD] == 2);      // "ab|", the end of the short line
+    vertical(r, t, 1, false);
+    assert(r[state.R_HEAD] == 7);      // back to column 4
+    vertical(r, t, 1, false);
+    assert(r[state.R_HEAD] == 10);     // "x|": the last line is short
+}
+
+test "home, end and the ends of the text" {
+    I64[64] r;
+    U8[16] t;
+    load(r, t);
+    go(r, 5, false);
+    home(r, t, false);
+    assert(r[state.R_HEAD] == 3);
+    end(r, t, false);
+    assert(r[state.R_HEAD] == 8);
+    doc_end(r, t, false);
+    assert(r[state.R_HEAD] == 10);
+    vertical(r, t, 1, false);
+    assert(r[state.R_HEAD] == 10);
+    doc_start(r, false);
+    vertical(r, t, -1, false);
+    assert(r[state.R_HEAD] == 0);
+}
+
+test "shift extends the selection and a plain move collapses it" {
+    I64[64] r;
+    U8[16] t;
+    load(r, t);
+    go(r, 3, false);
+    right(r, t, true);
+    right(r, t, true);
+    assert(r[state.R_ANCHOR] == 3);
+    assert(r[state.R_HEAD] == 5);
+    left(r, t, false);
+    assert(r[state.R_ANCHOR] == 3);
+    assert(r[state.R_HEAD] == 3);
+}
+
+test "word moves skip punctuation, then a word" {
+    I64[64] r;
+    U8[16] t;
+    buf.reset(r, t);
+    U8[11] s = b"ab, cd_e +f";
+    assert(buf.insert(r, t, 0, s));
+    go(r, 0, false);
+    word_right(r, t, false);
+    assert(r[state.R_HEAD] == 2);
+    word_right(r, t, false);
+    assert(r[state.R_HEAD] == 8);      // "cd_e" is one word
+    word_left(r, t, false);
+    assert(r[state.R_HEAD] == 4);
+}
+
+test "a tab advances to the next multiple of four" {
+    I64[64] r;
+    U8[16] t;
+    buf.reset(r, t);
+    U8[4] s = b"a\tbc";
+    assert(buf.insert(r, t, 0, s));
+    assert(column(r, t, 2) == 4);
+    assert(at_column(r, t, 0, 5) == 3);
+    assert(at_column(r, t, 0, 2) == 1);   // inside the tab: before it
+}

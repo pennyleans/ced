@@ -1,0 +1,215 @@
+// core.ci: the editor as a pure function (SPEC.md STATE-3, D-2).
+//
+// These entry points are the whole editor apart from I/O: give `load` the file's bytes, give
+// `step` the bytes the terminal sent, and it answers with the bytes to send back (the frame in
+// `o`) and requests in r[R_REQ] (save, quit, bell). ced.ci calls them with real I/O around them;
+// the tests below call them with made-up input. Because nothing here reads a clock, a file or
+// the terminal, the same input always gives the same output, byte for byte.
+//
+// The tables, always in this order: r registers, t text, u and ub the undo log, clip the
+// clipboard, name the file name, f the search text, grid the screen cells, o the output bytes.
+
+import state;
+import buf;
+import undo;
+import cur;
+import keys;
+import edit;
+import keymap;
+import view;
+import term;
+
+export void init(inout I64[_] r, inout U8[_] t, I64 rows, I64 cols) {
+    for i in 0..len(r) {
+        r[i] = 0;
+    }
+    buf.reset(r, t);
+    undo.reset(r);
+    r[state.R_ROWS] = max(rows, 3);
+    r[state.R_COLS] = max(cols, 1);
+    r[state.R_GOAL] = -1;
+}
+
+// Loads the file's bytes and its name. Refuses a file ced cannot edit (TEXT-1).
+export I64 load(inout I64[_] r, inout U8[_] t, inout U8[_] name, in U8[_] bytes, in U8[_] nm,
+                Bool new_file) {
+    if (len(bytes) > len(t) / 2) {
+        return state.E_TOO_LARGE;
+    }
+    for i in 0..len(bytes) {
+        if (bytes[i] == 0) {
+            return state.E_NUL;
+        }
+    }
+    if (!keys.valid_utf8(bytes)) {
+        return state.E_NOT_UTF8;
+    }
+    buf.reset(r, t);
+    assert(buf.insert(r, t, 0, bytes));
+    undo.reset(r);
+    cur.go(r, 0, false);
+    I64 n = min(len(nm), len(name));
+    for i in 0..n {
+        name[i] = nm[i];
+    }
+    r[state.R_NAME_LEN] = n;
+    r[state.R_NEW_FILE] = 0;
+    if (new_file) {
+        r[state.R_NEW_FILE] = 1;
+    }
+    return state.OK;
+}
+
+// Draws the frame into o.
+export void draw(inout I64[_] r, in U8[_] t, in U8[_] name, in U8[_] f, inout I64[_] grid,
+                 inout U8[_] o) {
+    view.render(r, t, name, f, grid);
+    term.frame(r, grid, o);
+}
+
+// Inserts pasted bytes, with CR and CR LF made LF (a terminal pastes line ends as CR).
+void paste_bytes(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, in U8[_] p) {
+    U8[4096] s;
+    I64 n = 0;
+    I64 i = 0;
+    while (i < len(p)) {
+        U8 c = p[i];
+        if (c == 13) {
+            c = 10;
+            if (i + 1 < len(p) && p[i + 1] == 10) {
+                i += 1;
+            }
+        }
+        s[n] = c;
+        n += 1;
+        i += 1;
+        if (n == len(s) || i == len(p)) {
+            edit.insert_block(r, t, u, ub, s[0..n]);
+            n = 0;
+        }
+    }
+}
+
+// One chunk of input. Runs every whole key in it and draws a frame. Returns how many bytes it
+// used: the rest begins a key that the next chunk completes, and the caller hands those bytes
+// back at the front of the next chunk (KEY-2).
+export I64 step(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, inout U8[_] clip,
+                in U8[_] name, inout U8[_] f, inout I64[_] grid, inout U8[_] o, in U8[_] input) {
+    I64 i = 0;
+    I64[2] k;
+    while (i < len(input)) {
+        if (r[state.R_PASTE] == 1) {
+            I64 n = keys.paste_len(input, i, k);
+            I64 body = n;
+            if (k[0] == 1) {
+                body = n - 6;
+                r[state.R_PASTE] = 0;
+            }
+            paste_bytes(r, t, u, ub, input[i..i + body]);
+            i += n;
+            continue;
+        }
+        I64 used = keys.decode(input, i, k);
+        if (used == 0) {
+            break;
+        }
+        i += used;
+        if (k[0] == keys.K_PASTE) {
+            r[state.R_PASTE] = 1;
+        } else if (k[0] == keys.K_NONE) {
+            r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+        } else {
+            keymap.dispatch(r, t, u, ub, clip, f, k[0], r[state.R_ROWS]);
+        }
+    }
+    draw(r, t, name, f, grid, o);
+    return i;
+}
+
+export void resize(inout I64[_] r, in U8[_] t, in U8[_] name, in U8[_] f, inout I64[_] grid,
+                   inout U8[_] o, I64 rows, I64 cols) {
+    r[state.R_ROWS] = max(rows, 3);
+    r[state.R_COLS] = max(cols, 1);
+    draw(r, t, name, f, grid, o);
+}
+
+// The whole text, contiguous, for saving; returns its length.
+export I64 text_out(in I64[_] r, in U8[_] t, inout U8[_] dst) {
+    return buf.copy_out(r, t, dst);
+}
+
+// The result of a save ced.ci attempted.
+export void saved(inout I64[_] r, Bool ok) {
+    if (ok) {
+        undo.mark_saved(r);
+        r[state.R_NEW_FILE] = 0;
+        r[state.R_MSG] = state.MSG_SAVED;
+    } else {
+        r[state.R_MSG] = state.MSG_SAVE_FAILED;
+    }
+}
+
+// A session in miniature: type, select, undo, save. The checks a golden case makes (TEST-2).
+test "a short session" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    U8[64] clip;
+    U8[16] name;
+    U8[16] f;
+    I64[60] grid;
+    U8[2048] o;
+    init(r, t, 5, 12);
+    U8[0] empty;
+    U8[3] nm = b"a.c";
+    assert(load(r, t, name, empty, nm, true) == state.OK);
+    // "hi", Enter, "yo", Shift+Left, Ctrl+X
+    U8[13] in1 = b"hi\ryo\x1b[1;2D\x18x";
+    assert(step(r, t, u, ub, clip, name, f, grid, o, in1) == 13);
+    // h i LF y x: "yo" became "yx" (cut the o, typed x)
+    U8[5] want = b"hi\nyx";
+    U8[64] got;
+    I64 n = text_out(r, t, got);
+    assert(n == 5);
+    for j in 0..5 {
+        assert(got[j] == want[j]);
+    }
+    assert(undo.modified(r));
+    // Ctrl+S asks for a save.
+    U8[1] save = b"\x13";
+    assert(step(r, t, u, ub, clip, name, f, grid, o, save) == 1);
+    assert((r[state.R_REQ] & state.REQ_SAVE) != 0);
+    saved(r, true);
+    assert(!undo.modified(r));
+    // A key cut off at the end of a chunk is left for the next one.
+    U8[3] cut = b"\x1b[1";
+    assert(step(r, t, u, ub, clip, name, f, grid, o, cut) == 0);
+}
+
+test "a file that is not UTF-8 is refused" {
+    I64[64] r;
+    U8[64] t;
+    U8[16] name;
+    init(r, t, 5, 12);
+    U8[2] bad = b"\xffa";
+    U8[1] nm = b"x";
+    assert(load(r, t, name, bad, nm, false) == state.E_NOT_UTF8);
+}
+
+test "a bracketed paste goes in as text, CR as LF" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    U8[64] clip;
+    U8[16] name;
+    U8[16] f;
+    I64[60] grid;
+    U8[2048] o;
+    init(r, t, 5, 12);
+    U8[15] p = b"\x1b[200~a\rb\x1b[201~";
+    assert(step(r, t, u, ub, clip, name, f, grid, o, p) == 15);
+    assert(buf.length(r, t) == 3);
+    assert(buf.at(r, t, 1) == 10);
+}

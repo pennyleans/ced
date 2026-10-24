@@ -1,0 +1,213 @@
+// ced.ci: the program (SPEC.md RUN-1 to RUN-6).
+//
+// This is the only module that talks to the outside world, through cint's console and fs
+// services; everything it shows or decides comes from core.ci. Its job is a loop:
+//
+//   raw mode on, read the window size, read the file, draw;
+//   then forever: wait up to 50 ms for input, hand it to the core, write the frame it gives back,
+//   save or quit if the core asked to, and redraw if the window changed size.
+//
+// The grants decide what it may touch: the console, and the directory of the file, which cint
+// grants as /arg1 because ced declares it (cint SPEC-07 SEC-CAP-6a). The file is main's one
+// program argument, a host path: its last part is the name, read as /arg1/<name> (RUN-2).
+
+import console;
+import fs;
+import state;
+import core;
+
+requires console.input;
+requires console.raw;
+requires fs.read("/arg1");
+requires fs.write("/arg1");
+
+// The small tables live at module level; cint keeps module-level arrays to 64 KiB each.
+I64[64] r;
+U8[256] name;
+U8[256] arg;           // the file name: the last part of the argument
+U8[256] f;
+U8[4096] chunk;
+U8[262] path;
+
+// The large tables are main's locals, storage of cint's frame arena (cint SPEC-04 LS-110).
+// They hold 46,967,168 elements, and fs.read and fs.put stage a copy of the file's bytes in the
+// same arena, so ced is run with `--frame-arena 67108864` (STATE-2).
+const I64 TEXT = 16777216;      // the gap buffer; a file of up to half of it loads (TEXT-1)
+const I64 UNDO = 589824;        // 65,536 undo records of 9 values
+const I64 UNDO_BYTES = 4194304;
+const I64 CLIP = 8388608;
+const I64 GRID = 40000;         // state.MAX_ROWS * state.MAX_COLS
+const I64 OUT = 200000;
+const I64 FILE = 16777216;      // the file's bytes at load, and the text at save
+
+// Builds "/arg1/<name>" in path; returns its length.
+I64 edit_path() {
+    path[0..6] = b"/arg1/";
+    I64 n = r[state.R_NAME_LEN];
+    for i in 0..n {
+        path[6 + i] = name[i];
+    }
+    return 6 + n;
+}
+
+void write_frame(Grants g, in U8[_] o) {
+    _ = console.write(g, o[0..r[state.R_OUT_LEN]]);
+}
+
+// The file's size, -1 when it does not exist, -3 when the name is not one logical segment (a
+// `path` error, or no grant covers it), -2 when it cannot be read.
+I64 file_size(Grants g, in U8[_] p) {
+    I64 n = fs.stat(g, p) catch (e) {
+        if (e == fs.FsError.not_found) {
+            return -1;
+        }
+        if (e == fs.FsError.path || e == fs.FsError.denied) {
+            return -3;
+        }
+        return -2;
+    };
+    return n;
+}
+
+void save(Grants g, in U8[_] t, inout U8[_] file) {
+    I64 n = core.text_out(r, t, file);
+    I64 p = edit_path();
+    Bool ok = true;
+    // Replaces the file atomically (SEC-OS-8); a failure leaves the file as it was.
+    fs.put(g, path[0..p], file[0..n]) catch (e) {
+        ok = false;
+    };
+    core.saved(r, ok);
+}
+
+// Leaves raw mode and says why ced stopped.
+void fail(Grants g) {
+    _ = console.raw(g, false);
+}
+
+export void main(Grants g, in U8[_] args) {
+    U8[TEXT] t;
+    I64[UNDO] u;
+    U8[UNDO_BYTES] ub;
+    U8[CLIP] clip;
+    I64[GRID] grid;
+    U8[OUT] o;
+    U8[FILE] file;
+
+    // The file: one argument, a host path and a NUL. Its last part, after / or \, is the name.
+    I64 nl = len(args) - 1;
+    if (nl <= 0 || args[nl] != 0) {
+        "ced: give one file: cint run --frame-arena 67108864 ced.ci -- FILE\n";
+        return;
+    }
+    I64 start = 0;
+    for i in 0..nl {
+        if (args[i] == 0) {
+            "ced: give one file: cint run --frame-arena 67108864 ced.ci -- FILE\n";
+            return;
+        }
+        if (args[i] == '/' || args[i] == '\\') {
+            start = i + 1;
+        }
+    }
+    nl -= start;
+    if (nl <= 0 || nl > len(arg)) {
+        "ced: give a file, not a directory, with a name of at most 256 bytes\n";
+        return;
+    }
+    for i in 0..nl {
+        arg[i] = args[start + i];
+    }
+
+    console.raw(g, true) catch (e) {
+        "ced: this terminal has no raw mode\n";
+        return;
+    };
+    I64 w = console.window(g) catch 6442450944 + 80;   // 24 rows, 80 columns
+    core.init(r, t, w / 4294967296, w % 4294967296);
+    for i in 0..nl {
+        name[i] = arg[i];
+    }
+    r[state.R_NAME_LEN] = nl;
+    I64 p = edit_path();
+
+    // Read the file, or start empty when it does not exist yet.
+    I64 fsize = file_size(g, path[0..p]);
+    Bool new_file = fsize == -1;
+    if (new_file) {
+        fsize = 0;
+    }
+    if (fsize == -3) {
+        fail(g);
+        "ced: this name is not allowed: letters, digits, _ - . only, no spaces\n";
+        return;
+    }
+    if (fsize < 0 || fsize > len(file)) {
+        fail(g);
+        "ced: cannot read the file\n";
+        return;
+    }
+    I64 got = 0;
+    if (fsize > 0) {
+        got = fs.read(g, path[0..p], 0, file[0..fsize]) catch -1;
+    }
+    if (got != fsize) {
+        fail(g);
+        "ced: cannot read the file\n";
+        return;
+    }
+    I64 st = core.load(r, t, name, file[0..fsize], arg[0..nl], new_file);
+    if (st != state.OK) {
+        fail(g);
+        "ced: the file is not UTF-8 text ced can edit (status {st})\n";
+        return;
+    }
+    U8[0] none;
+    _ = core.step(r, t, u, ub, clip, name, f, grid, o, none);
+    write_frame(g, o);
+
+    // The loop. `held` bytes at the front of chunk start a key the next read completes.
+    I64 held = 0;
+    I64 rows = r[state.R_ROWS];
+    I64 cols = r[state.R_COLS];
+    while (true) {
+        I64 n = console.read(g, chunk[held..], 50) catch -1;
+        if (n < 0) {
+            break;
+        }
+        if (n > 0 || held > 0) {
+            I64 total = held + n;
+            I64 used = core.step(r, t, u, ub, clip, name, f, grid, o, chunk[0..total]);
+            if (n == 0 && used == 0) {
+                // A key left unfinished with nothing more coming: drop it.
+                used = total;
+            }
+            for i in used..total {
+                chunk[i - used] = chunk[i];
+            }
+            held = total - used;
+            if ((r[state.R_REQ] & state.REQ_SAVE) != 0) {
+                save(g, t, file);
+                core.draw(r, t, name, f, grid, o);
+            }
+            write_frame(g, o);
+            if ((r[state.R_REQ] & state.REQ_BELL) != 0) {
+                _ = console.write(g, "\x07");
+            }
+            if ((r[state.R_REQ] & state.REQ_QUIT) != 0) {
+                break;
+            }
+            r[state.R_REQ] = 0;
+        }
+        I64 w2 = console.window(g) catch w;
+        if (w2 / 4294967296 != rows || w2 % 4294967296 != cols) {
+            rows = w2 / 4294967296;
+            cols = w2 % 4294967296;
+            core.resize(r, t, name, f, grid, o, rows, cols);
+            write_frame(g, o);
+        }
+    }
+    // Clear the screen and leave raw mode.
+    _ = console.write(g, "\x1b[0m\x1b[2J\x1b[H");
+    _ = console.raw(g, false);
+}

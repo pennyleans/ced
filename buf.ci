@@ -1,0 +1,199 @@
+// buf.ci: the text of the file being edited, as a gap buffer of UTF-8 bytes (SPEC.md TEXT-1
+// to TEXT-3).
+//
+// The bytes live in one table `t`. An unused stretch of it, the gap, sits wherever the last
+// edit happened: the text is t[0, gs) followed by t[ge, len(t)), with gs = r[state.R_GAP_START] and
+// ge = r[state.R_GAP_END]. Typing at the gap only fills it, and deleting only widens it, so an edit
+// costs nothing however long the file is. Moving the caret far away and editing there first
+// moves the gap, which copies the bytes between the old place and the new one.
+//
+// Positions are offsets into the text as the user sees it, 0 to length(r, t), never into t.
+// Every function here is pure: it reads and writes only the tables it is given (D-2).
+
+import state;
+
+// An empty text: the gap is the whole table.
+export void reset(inout I64[_] r, in U8[_] t) {
+    r[state.R_GAP_START] = 0;
+    r[state.R_GAP_END] = len(t);
+    r[state.R_LF_AT] = 0;
+    r[state.R_LF_COUNT] = 0;
+}
+
+// An edit at p moves the line-count mark back to the start when p is before it.
+void edited(inout I64[_] r, I64 p) {
+    if (p < r[state.R_LF_AT]) {
+        r[state.R_LF_AT] = 0;
+        r[state.R_LF_COUNT] = 0;
+    }
+}
+
+// The line feeds before text position p, counted from the mark, which then moves to p.
+export I64 lines_before(inout I64[_] r, in U8[_] t, I64 p) {
+    I64 m = r[state.R_LF_AT];
+    I64 n = r[state.R_LF_COUNT];
+    while (m < p) {
+        if (at(r, t, m) == 10) {
+            n += 1;
+        }
+        m += 1;
+    }
+    while (m > p) {
+        m -= 1;
+        if (at(r, t, m) == 10) {
+            n -= 1;
+        }
+    }
+    r[state.R_LF_AT] = p;
+    r[state.R_LF_COUNT] = n;
+    return n;
+}
+
+export I64 length(in I64[_] r, in U8[_] t) {
+    return len(t) - (r[state.R_GAP_END] - r[state.R_GAP_START]);
+}
+
+// Bytes that fit before the table is full.
+export I64 room(in I64[_] r) {
+    return r[state.R_GAP_END] - r[state.R_GAP_START];
+}
+
+// The byte at text position p.
+export U8 at(in I64[_] r, in U8[_] t, I64 p) {
+    I64 gs = r[state.R_GAP_START];
+    if (p < gs) {
+        return t[p];
+    }
+    return t[p + (r[state.R_GAP_END] - gs)];
+}
+
+// Moves the gap so that it starts at text position p. The bytes between the old and the new
+// place cross the gap one at a time; the source and the destination overlap, so `copy` (which
+// needs disjoint views) is not used.
+export void move_gap(inout I64[_] r, inout U8[_] t, I64 p) {
+    I64 gs = r[state.R_GAP_START];
+    I64 ge = r[state.R_GAP_END];
+    assert(p >= 0 && p <= len(t) - (ge - gs));
+    while (gs > p) {
+        gs -= 1;
+        ge -= 1;
+        t[ge] = t[gs];
+    }
+    while (gs < p) {
+        t[gs] = t[ge];
+        gs += 1;
+        ge += 1;
+    }
+    r[state.R_GAP_START] = gs;
+    r[state.R_GAP_END] = ge;
+}
+
+// Inserts s at text position p. Returns false, changing nothing, when s does not fit (D-5).
+export Bool insert(inout I64[_] r, inout U8[_] t, I64 p, in U8[_] s) {
+    if (len(s) > room(r)) {
+        return false;
+    }
+    edited(r, p);
+    move_gap(r, t, p);
+    I64 gs = r[state.R_GAP_START];
+    for i in 0..len(s) {
+        t[gs + i] = s[i];
+    }
+    r[state.R_GAP_START] = gs + len(s);
+    return true;
+}
+
+// Removes n bytes starting at text position p.
+export void remove(inout I64[_] r, inout U8[_] t, I64 p, I64 n) {
+    assert(n >= 0 && p + n <= length(r, t));
+    edited(r, p);
+    move_gap(r, t, p);
+    r[state.R_GAP_END] = r[state.R_GAP_END] + n;
+}
+
+// Writes the whole text, contiguous, to the start of dst and returns its length (for saving).
+export I64 copy_out(in I64[_] r, in U8[_] t, inout U8[_] dst) {
+    I64 n = length(r, t);
+    for i in 0..n {
+        dst[i] = at(r, t, i);
+    }
+    return n;
+}
+
+test "an empty buffer has no text and a full gap" {
+    I64[64] r;
+    U8[8] t;
+    reset(r, t);
+    assert(length(r, t) == 0);
+    assert(room(r) == 8);
+}
+
+test "typing fills the gap" {
+    I64[64] r;
+    U8[8] t;
+    reset(r, t);
+    U8[4] helo = b"helo";
+    U8[1] l = b"l";
+    assert(insert(r, t, 0, helo));
+    assert(insert(r, t, 3, l));
+    U8[8] got;
+    I64 n = copy_out(r, t, got);
+    U8[5] hello = b"hello";
+    assert(n == 5);
+    assert(equal(got[0..n], hello));
+}
+
+test "removing widens the gap" {
+    I64[64] r;
+    U8[8] t;
+    reset(r, t);
+    U8[6] abcdef = b"abcdef";
+    assert(insert(r, t, 0, abcdef));
+    remove(r, t, 1, 3);
+    U8[8] got;
+    I64 n = copy_out(r, t, got);
+    U8[3] aef = b"aef";
+    assert(equal(got[0..n], aef));
+    assert(room(r) == 5);
+}
+
+test "the gap moves both ways and the text stays the same" {
+    I64[64] r;
+    U8[8] t;
+    reset(r, t);
+    U8[4] abcd = b"abcd";
+    assert(insert(r, t, 0, abcd));
+    move_gap(r, t, 1);
+    assert(at(r, t, 0) == 'a');
+    assert(at(r, t, 3) == 'd');
+    move_gap(r, t, 4);
+    assert(at(r, t, 1) == 'b');
+}
+
+test "an insert that does not fit changes nothing" {
+    I64[64] r;
+    U8[4] t;
+    reset(r, t);
+    U8[3] abc = b"abc";
+    U8[2] xy = b"xy";
+    assert(insert(r, t, 0, abc));
+    assert(!insert(r, t, 1, xy));
+    assert(length(r, t) == 3);
+}
+
+test "the line count follows the caret and survives edits before it" {
+    I64[64] r;
+    U8[32] t;
+    reset(r, t);
+    U8[6] abc = b"a\nb\nc\n";
+    assert(insert(r, t, 0, abc));
+    assert(lines_before(r, t, 4) == 2);
+    assert(lines_before(r, t, 1) == 0);
+    assert(lines_before(r, t, 6) == 3);
+    U8[2] nl = b"x\n";
+    assert(insert(r, t, 0, nl));
+    assert(r[state.R_LF_AT] == 0);
+    assert(lines_before(r, t, 8) == 4);
+    remove(r, t, 0, 2);
+    assert(lines_before(r, t, 6) == 3);
+}

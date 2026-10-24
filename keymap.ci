@@ -1,0 +1,80 @@
+// keymap.ci: keys to commands (SPEC.md D-3, KEY-3 to KEY-9).
+//
+// This is the one place that knows which key does what. Everything below it (edit.ci, cur.ci,
+// search.ci) is a command that does not care how it was asked for, and everything above it
+// (core.ci) only hands it keys. A vim mode later is a second keymap, not a rewrite.
+
+import state;
+import keys;
+import cur;
+import edit;
+import search;
+
+// Runs the command bound to key k. `rows` is the window's height, for PgUp and PgDn.
+export void dispatch(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub,
+                     inout U8[_] clip, inout U8[_] f, I64 k, I64 rows) {
+    r[state.R_MSG] = state.MSG_NONE;
+    if (k != keys.M_CTRL + 'q') {
+        r[state.R_QUIT_ARMED] = 0;
+    }
+    if (r[state.R_MODE] != state.MODE_EDIT) {
+        search.key(r, t, f, k);
+        return;
+    }
+    Bool shift = (k & keys.M_SHIFT) != 0;
+    I64 base = k & ~keys.M_SHIFT;
+    I64 page = max(rows - 3, 1);
+
+    // Text: a code point with no Ctrl or Alt.
+    if (k >= 32 && k < keys.K_UP) {
+        U8[4] s;
+        I64 w = keys.encode(k, s);
+        edit.type_text(r, t, u, ub, s[0..w]);
+        return;
+    }
+
+    // Anything else ends a run of typing, so its undo group closes.
+    edit.end_run(r);
+    switch (base) {
+        case keys.K_LEFT: cur.left(r, t, shift);
+        case keys.K_RIGHT: cur.right(r, t, shift);
+        case keys.K_UP: cur.vertical(r, t, -1, shift);
+        case keys.K_DOWN: cur.vertical(r, t, 1, shift);
+        case keys.K_HOME: cur.home(r, t, shift);
+        case keys.K_END: cur.end(r, t, shift);
+        case keys.K_PGUP: cur.vertical(r, t, -page, shift);
+        case keys.K_PGDN: cur.vertical(r, t, page, shift);
+        case keys.K_LEFT + keys.M_CTRL: cur.word_left(r, t, shift);
+        case keys.K_RIGHT + keys.M_CTRL: cur.word_right(r, t, shift);
+        case keys.K_HOME + keys.M_CTRL: cur.doc_start(r, shift);
+        case keys.K_END + keys.M_CTRL: cur.doc_end(r, t, shift);
+        case keys.K_ENTER: edit.enter(r, t, u, ub);
+        case keys.K_TAB: {
+            U8[1] tab = b"\t";
+            edit.insert_block(r, t, u, ub, tab);
+        }
+        case keys.K_BACKSPACE: edit.backspace(r, t, u, ub);
+        case keys.K_DELETE: edit.delete_forward(r, t, u, ub);
+        case keys.K_F3: search.again(r, t, f, shift);
+        case keys.M_CTRL + 'a': edit.select_all(r, t);
+        case keys.M_CTRL + 'c': edit.copy_sel(r, t, clip);
+        case keys.M_CTRL + 'x': edit.cut(r, t, u, ub, clip);
+        case keys.M_CTRL + 'v': edit.paste(r, t, u, ub, clip);
+        case keys.M_CTRL + 'z': {
+            if (shift) {
+                edit.redo_cmd(r, t, u, ub);
+            } else {
+                edit.undo_cmd(r, t, u, ub);
+            }
+        }
+        case keys.M_CTRL + 'y': edit.redo_cmd(r, t, u, ub);
+        case keys.M_CTRL + 's': r[state.R_REQ] = r[state.R_REQ] | state.REQ_SAVE;
+        case keys.M_CTRL + 'q': edit.quit(r);
+        case keys.M_CTRL + 'f': search.open_find(r);
+        case keys.M_CTRL + 'g': search.open_line(r);
+        case keys.K_ESC: {
+            cur.go(r, r[state.R_HEAD], false);   // Esc drops the selection
+        }
+        default: r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;   // KEY-9
+    }
+}

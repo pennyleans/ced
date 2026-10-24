@@ -1,0 +1,93 @@
+// state.ci: the names of the editor's registers (SPEC.md STATE-1). Every core module works on
+// tables passed to it; the registers are one small table of I64 values, `r`, and these
+// constants name its slots, so that no two modules use one slot for different things.
+
+// The text (buf.ci): the gap is r[R_GAP_START] up to r[R_GAP_END].
+export const I64 R_GAP_START = 2;
+export const I64 R_GAP_END = 3;
+
+// The selection: anchor and head (the caret), as text positions (TEXT-4).
+export const I64 R_ANCHOR = 14;
+export const I64 R_HEAD = 15;
+
+// The undo log (undo.ci).
+export const I64 R_U_RECS = 16;    // records in the log
+export const I64 R_U_AT = 17;      // records applied; undo steps back from here, redo forward
+export const I64 R_U_BYTES = 18;   // bytes of the byte store in use
+export const I64 R_U_GROUP = 19;   // the next group number
+export const I64 R_U_SAVED = 20;   // R_U_AT at the last load or save, or -1 when that point is gone
+
+// The caret's goal column (cur.ci): up and down aim for it across lines of other lengths
+// (TEXT-4); -1 when the next vertical move should take the caret's own column.
+export const I64 R_GOAL = 21;
+
+// Requests to ced.ci (STATE-4): bits of r[R_REQ].
+export const I64 R_REQ = 6;
+export const I64 REQ_SAVE = 1;
+export const I64 REQ_QUIT = 2;
+export const I64 REQ_BELL = 4;
+
+// The run of typing or backspacing that the next keystroke may join (edit.ci, UNDO-2).
+export const I64 R_RUN_KIND = 22;    // 0 none, RUN_TYPE or RUN_BACK
+export const I64 R_RUN_GROUP = 23;   // its undo group
+export const I64 R_RUN_POS = 24;     // where the caret must be for the next key to join it
+export const I64 R_RUN_COUNT = 25;   // characters in it
+export const I64 RUN_TYPE = 1;
+export const I64 RUN_BACK = 2;
+
+export const I64 R_CLIP_LEN = 26;    // bytes in the clipboard table
+export const I64 R_MSG = 27;         // the status line's message, one of MSG_
+export const I64 R_QUIT_ARMED = 28;  // 1 after a Ctrl+Q that only warned (KEY-7)
+
+export const I64 MSG_NONE = 0;
+export const I64 MSG_TOO_BIG = 1;          // "the text does not fit"
+export const I64 MSG_HISTORY_CLEARED = 2;  // "undo history cleared: the edit was too large"
+export const I64 MSG_SAVED = 3;
+export const I64 MSG_SAVE_FAILED = 4;
+export const I64 MSG_NOT_FOUND = 5;
+export const I64 MSG_WRAPPED = 6;
+export const I64 MSG_QUIT_WARN = 7;        // "unsaved changes: Ctrl+Q again to quit"
+export const I64 MSG_NOTHING_TO_UNDO = 8;
+export const I64 MSG_NOTHING_TO_REDO = 9;
+
+// Prompts on the last row (search.ci): find (FIND-1 to FIND-3) and go to line (KEY-8).
+export const I64 R_MODE = 29;         // MODE_EDIT, MODE_FIND or MODE_LINE
+export const I64 MODE_EDIT = 0;
+export const I64 MODE_FIND = 1;
+export const I64 MODE_LINE = 2;
+export const I64 R_FIND_LEN = 30;     // bytes of the search text in the find table
+export const I64 R_ORIGIN = 31;       // the caret when the prompt opened
+export const I64 R_LINE_NUM = 32;     // the number typed so far at the line prompt
+
+// The window and the view (view.ci, term.ci).
+export const I64 R_ROWS = 33;
+export const I64 R_COLS = 34;
+export const I64 R_TOP = 35;          // text position of the first line shown
+export const I64 R_LEFT = 36;         // the first column shown
+export const I64 R_CUR_ROW = 37;      // where the terminal cursor goes, 0-based
+export const I64 R_CUR_COL = 38;
+export const I64 R_NAME_LEN = 39;     // bytes of the file name in the name table
+export const I64 R_NEW_FILE = 40;     // 1 when the file did not exist at load
+export const I64 R_OUT_LEN = 4;       // bytes term.ci wrote to the out table
+export const I64 MAX_ROWS = 100;      // the grid's capacity (STATE-2)
+export const I64 MAX_COLS = 400;
+
+// A grid cell is a code point plus a style times STYLE.
+export const I64 STYLE = 2097152;     // 1 << 21, above every code point
+export const I64 S_PLAIN = 0;
+export const I64 S_SELECTED = 1;      // reverse video
+export const I64 S_BAR = 2;           // the status line, reverse video
+
+// Input across chunks (core.ci).
+export const I64 R_PASTE = 41;        // 1 inside a bracketed paste
+
+// The line-count mark (buf.ci, view.ci): R_LF_COUNT line feeds lie before text position R_LF_AT.
+// An edit before the mark resets it to the start, so the status line counts only from there.
+export const I64 R_LF_AT = 42;
+export const I64 R_LF_COUNT = 43;
+
+// Status codes of core.ci's entry points.
+export const I64 OK = 0;
+export const I64 E_NOT_UTF8 = 1;      // the file is not valid UTF-8 (TEXT-1)
+export const I64 E_NUL = 2;           // the file holds a NUL byte
+export const I64 E_TOO_LARGE = 3;     // the file is larger than half the text table

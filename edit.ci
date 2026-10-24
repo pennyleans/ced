@@ -1,0 +1,374 @@
+// edit.ci: the editing commands (SPEC.md KEY-4 to KEY-7, UNDO-2).
+//
+// Every change to the text goes through `replace`: take the selection (or any range) out, put
+// some bytes in, and log both in the undo log. Typing a letter is replace(selection, "a");
+// Backspace is replace(previous character, nothing); paste is replace(selection, clipboard).
+// What differs between commands is only the range, the bytes, and which undo group they join.
+//
+// Grouping (UNDO-2): letters typed one after another on one line share a group, so Ctrl+Z takes
+// back a word rather than a letter, until the caret moves some other way, Enter is pressed, or the
+// run reaches RUN_MAX characters. A run of Backspaces is grouped the same way.
+
+import state;
+import buf;
+import undo;
+import cur;
+
+const I64 RUN_MAX = 64;
+const U8 LF = 10;
+
+// The tables every command works on, in this order: r (registers), t (text), u and ub (the undo
+// log), clip (the clipboard).
+
+// Ends any run of typing or backspacing, so the next keystroke starts a new undo group.
+export void end_run(inout I64[_] r) {
+    r[state.R_RUN_KIND] = 0;
+}
+
+// The undo group for a keystroke of run kind `kind` at the caret: the current run's, or a new one.
+I64 run_group(inout I64[_] r, in I64[_] u, I64 kind) {
+    I64 h = r[state.R_HEAD];
+    if (r[state.R_RUN_KIND] == kind && r[state.R_RUN_POS] == h && r[state.R_RUN_COUNT] < RUN_MAX
+        && undo.last_group(r, u) == r[state.R_RUN_GROUP]) {
+        r[state.R_RUN_COUNT] = r[state.R_RUN_COUNT] + 1;
+        return r[state.R_RUN_GROUP];
+    }
+    I64 g = undo.new_group(r);
+    r[state.R_RUN_KIND] = kind;
+    r[state.R_RUN_GROUP] = g;
+    r[state.R_RUN_COUNT] = 1;
+    return g;
+}
+
+// Replaces text [a, b) with s as one change of undo group g, and puts the caret after it.
+// Returns false, changing nothing, when the result would not fit (D-5).
+export Bool replace(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, I64 g,
+                    I64 a, I64 b, in U8[_] s) {
+    I64 n = b - a;
+    if (len(s) > buf.room(r) + n) {
+        r[state.R_MSG] = state.MSG_TOO_BIG;
+        r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+        return false;
+    }
+    // With the gap moved to a, the removed bytes sit together just after it.
+    buf.move_gap(r, t, a);
+    I64 ge = r[state.R_GAP_END];
+    I64 a0 = r[state.R_ANCHOR];
+    I64 h0 = r[state.R_HEAD];
+    I64 after = a + len(s);
+    if (!undo.record(r, u, ub, g, a, t[ge..ge + n], s, a0, h0, after, after)) {
+        r[state.R_MSG] = state.MSG_HISTORY_CLEARED;
+    }
+    buf.remove(r, t, a, n);
+    assert(buf.insert(r, t, a, s));
+    cur.go(r, after, false);
+    r[state.R_GOAL] = -1;
+    return true;
+}
+
+I64 sel_lo(in I64[_] r) {
+    return min(r[state.R_ANCHOR], r[state.R_HEAD]);
+}
+
+I64 sel_hi(in I64[_] r) {
+    return max(r[state.R_ANCHOR], r[state.R_HEAD]);
+}
+
+// Typed text: one code point's bytes, replacing the selection.
+export void type_text(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, in U8[_] s) {
+    I64 g = 0;
+    if (sel_lo(r) == sel_hi(r)) {
+        g = run_group(r, u, state.RUN_TYPE);
+    } else {
+        end_run(r);
+        g = undo.new_group(r);
+    }
+    if (replace(r, t, u, ub, g, sel_lo(r), sel_hi(r), s)) {
+        r[state.R_RUN_POS] = r[state.R_HEAD];
+    }
+}
+
+// A paste, or any text that is one command: its own undo group.
+export void insert_block(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, in U8[_] s) {
+    end_run(r);
+    _ = replace(r, t, u, ub, undo.new_group(r), sel_lo(r), sel_hi(r), s);
+}
+
+// Enter: a line end, then the spaces and tabs that start the current line (KEY-4).
+export void enter(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub) {
+    I64 ls = cur.line_start(r, t, sel_lo(r));
+    I64 k = 0;
+    while (ls + k < sel_lo(r) && (buf.at(r, t, ls + k) == ' ' || buf.at(r, t, ls + k) == 9) && k < 255) {
+        k += 1;
+    }
+    U8[256] s;
+    s[0] = LF;
+    for i in 0..k {
+        s[i + 1] = buf.at(r, t, ls + i);
+    }
+    insert_block(r, t, u, ub, s[0..k + 1]);
+}
+
+// Backspace: the selection, or the code point before the caret.
+export void backspace(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub) {
+    U8[0] none;
+    if (sel_lo(r) != sel_hi(r)) {
+        end_run(r);
+        _ = replace(r, t, u, ub, undo.new_group(r), sel_lo(r), sel_hi(r), none);
+        return;
+    }
+    I64 h = r[state.R_HEAD];
+    if (h == 0) {
+        r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+        return;
+    }
+    I64 g = run_group(r, u, state.RUN_BACK);
+    if (replace(r, t, u, ub, g, cur.prev_cp(r, t, h), h, none)) {
+        r[state.R_RUN_POS] = r[state.R_HEAD];
+    }
+}
+
+// Delete: the selection, or the code point after the caret. Its own group each time.
+export void delete_forward(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub) {
+    U8[0] none;
+    end_run(r);
+    I64 a = sel_lo(r);
+    I64 b = sel_hi(r);
+    if (a == b) {
+        b = cur.next_cp(r, t, a);
+        if (a == b) {
+            r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+            return;
+        }
+    }
+    _ = replace(r, t, u, ub, undo.new_group(r), a, b, none);
+}
+
+// The range copy and cut take: the selection, or the whole line with its line end (KEY-5).
+I64 cut_lo(in I64[_] r, in U8[_] t) {
+    if (sel_lo(r) != sel_hi(r)) {
+        return sel_lo(r);
+    }
+    return cur.line_start(r, t, r[state.R_HEAD]);
+}
+
+I64 cut_hi(in I64[_] r, in U8[_] t) {
+    if (sel_lo(r) != sel_hi(r)) {
+        return sel_hi(r);
+    }
+    I64 e = cur.line_end(r, t, r[state.R_HEAD]);
+    if (e < buf.length(r, t)) {
+        e += 1;
+    }
+    return e;
+}
+
+export void copy_sel(inout I64[_] r, in U8[_] t, inout U8[_] clip) {
+    end_run(r);
+    I64 a = cut_lo(r, t);
+    I64 b = cut_hi(r, t);
+    for i in a..b {
+        clip[i - a] = buf.at(r, t, i);
+    }
+    r[state.R_CLIP_LEN] = b - a;
+}
+
+export void cut(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, inout U8[_] clip) {
+    U8[0] none;
+    copy_sel(r, t, clip);
+    I64 a = cut_lo(r, t);
+    _ = replace(r, t, u, ub, undo.new_group(r), a, a + r[state.R_CLIP_LEN], none);
+}
+
+export void paste(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, in U8[_] clip) {
+    insert_block(r, t, u, ub, clip[0..r[state.R_CLIP_LEN]]);
+}
+
+export void select_all(inout I64[_] r, in U8[_] t) {
+    end_run(r);
+    r[state.R_ANCHOR] = 0;
+    r[state.R_HEAD] = buf.length(r, t);
+}
+
+export void undo_cmd(inout I64[_] r, inout U8[_] t, in I64[_] u, in U8[_] ub) {
+    end_run(r);
+    if (!undo.undo(r, u, ub, t)) {
+        r[state.R_MSG] = state.MSG_NOTHING_TO_UNDO;
+        r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+    }
+}
+
+export void redo_cmd(inout I64[_] r, inout U8[_] t, in I64[_] u, in U8[_] ub) {
+    end_run(r);
+    if (!undo.redo(r, u, ub, t)) {
+        r[state.R_MSG] = state.MSG_NOTHING_TO_REDO;
+        r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+    }
+}
+
+// Ctrl+Q (KEY-7): quits at once when the file is saved; otherwise the first press warns and a
+// second one in a row quits. Any other key disarms it (keymap.ci).
+export void quit(inout I64[_] r) {
+    if (!undo.modified(r) || r[state.R_QUIT_ARMED] == 1) {
+        r[state.R_REQ] = r[state.R_REQ] | state.REQ_QUIT;
+        return;
+    }
+    r[state.R_QUIT_ARMED] = 1;
+    r[state.R_MSG] = state.MSG_QUIT_WARN;
+}
+
+// Tests.
+
+I64 text(in I64[_] r, in U8[_] t, inout U8[_] dst) {
+    return buf.copy_out(r, t, dst);
+}
+
+Bool is(in I64[_] r, in U8[_] t, in U8[_] want) {
+    if (buf.length(r, t) != len(want)) {
+        return false;
+    }
+    for i in 0..len(want) {
+        if (buf.at(r, t, i) != want[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void key(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, U8 c) {
+    U8[1] s = [c];
+    type_text(r, t, u, ub, s);
+}
+
+void fresh(inout I64[_] r, inout U8[_] t) {
+    buf.reset(r, t);
+    undo.reset(r);
+    end_run(r);
+    cur.go(r, 0, false);
+}
+
+test "typed letters form one undo group" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    fresh(r, t);
+    key(r, t, u, ub, 'h');
+    key(r, t, u, ub, 'i');
+    U8[2] hi = b"hi";
+    assert(is(r, t, hi));
+    undo_cmd(r, t, u, ub);
+    assert(buf.length(r, t) == 0);
+}
+
+test "moving the caret starts a new group" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    fresh(r, t);
+    key(r, t, u, ub, 'a');
+    key(r, t, u, ub, 'b');
+    cur.left(r, t, false);
+    end_run(r);
+    key(r, t, u, ub, 'x');
+    U8[3] axb = b"axb";
+    assert(is(r, t, axb));
+    undo_cmd(r, t, u, ub);
+    U8[2] ab = b"ab";
+    assert(is(r, t, ab));
+}
+
+test "typing replaces the selection" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    fresh(r, t);
+    key(r, t, u, ub, 'a');
+    key(r, t, u, ub, 'b');
+    key(r, t, u, ub, 'c');
+    r[state.R_ANCHOR] = 0;
+    r[state.R_HEAD] = 2;
+    key(r, t, u, ub, 'z');
+    U8[2] zc = b"zc";
+    assert(is(r, t, zc));
+    undo_cmd(r, t, u, ub);
+    U8[3] abc = b"abc";
+    assert(is(r, t, abc));
+    assert(r[state.R_ANCHOR] == 0 && r[state.R_HEAD] == 2);
+}
+
+test "enter keeps the line's indentation" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    fresh(r, t);
+    key(r, t, u, ub, ' ');
+    key(r, t, u, ub, ' ');
+    key(r, t, u, ub, 'x');
+    enter(r, t, u, ub);
+    U8[6] want = b"  x\n  ";
+    assert(is(r, t, want));
+    assert(r[state.R_HEAD] == 6);
+}
+
+test "backspace runs group, delete removes forward" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    fresh(r, t);
+    key(r, t, u, ub, 'a');
+    key(r, t, u, ub, 'b');
+    key(r, t, u, ub, 'c');
+    end_run(r);
+    backspace(r, t, u, ub);
+    backspace(r, t, u, ub);
+    U8[1] a = b"a";
+    assert(is(r, t, a));
+    undo_cmd(r, t, u, ub);
+    U8[3] abc = b"abc";
+    assert(is(r, t, abc));
+    cur.go(r, 0, false);
+    delete_forward(r, t, u, ub);
+    U8[2] bc = b"bc";
+    assert(is(r, t, bc));
+}
+
+test "cut and paste a whole line with no selection" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    U8[64] clip;
+    fresh(r, t);
+    U8[6] two = b"ab\ncd\n";
+    insert_block(r, t, u, ub, two);
+    cur.go(r, 0, false);
+    cut(r, t, u, ub, clip);
+    U8[3] cd = b"cd\n";
+    assert(is(r, t, cd));
+    cur.doc_end(r, t, false);
+    paste(r, t, u, ub, clip);
+    U8[6] swapped = b"cd\nab\n";
+    assert(is(r, t, swapped));
+}
+
+test "quit warns once when modified" {
+    I64[64] r;
+    U8[64] t;
+    I64[900] u;
+    U8[256] ub;
+    fresh(r, t);
+    quit(r);
+    assert((r[state.R_REQ] & state.REQ_QUIT) != 0);
+    r[state.R_REQ] = 0;
+    key(r, t, u, ub, 'a');
+    quit(r);
+    assert((r[state.R_REQ] & state.REQ_QUIT) == 0);
+    assert(r[state.R_MSG] == state.MSG_QUIT_WARN);
+    quit(r);
+    assert((r[state.R_REQ] & state.REQ_QUIT) != 0);
+}

@@ -1,0 +1,88 @@
+// term.ci: the cell grid to terminal bytes (SPEC.md VIEW-4).
+//
+// A terminal is driven by the same kind of escape sequences that its keys send: ESC [ row ; col H
+// moves the cursor, ESC [ 7 m turns on reverse video and ESC [ 0 m turns it off, ESC [ ? 25 l
+// hides the cursor and ESC [ ? 25 h shows it. A frame is: hide the cursor, then for each row move
+// to its start and write its cells, switching style only where it changes, then put the cursor at
+// the caret and show it. The whole frame is redrawn each time; sending only the changed cells is
+// later (VIEW-5).
+
+import state;
+import keys;
+
+// Appends one byte to out at r[R_OUT_LEN].
+void b1(inout I64[_] r, inout U8[_] o, I64 v) {
+    o[r[state.R_OUT_LEN]] = v as U8;
+    r[state.R_OUT_LEN] = r[state.R_OUT_LEN] + 1;
+}
+
+// Appends bytes to out.
+void put(inout I64[_] r, inout U8[_] o, in U8[_] b) {
+    for i in 0..len(b) {
+        b1(r, o, b[i] as I64);
+    }
+}
+
+void num(inout I64[_] r, inout U8[_] o, I64 v) {
+    if (v >= 10) {
+        num(r, o, v / 10);
+    }
+    b1(r, o, '0' + v % 10);
+}
+
+// ESC [ row ; col H, both counted from 1.
+void move(inout I64[_] r, inout U8[_] o, I64 row, I64 col) {
+    put(r, o, b"\x1b[");
+    num(r, o, row + 1);
+    b1(r, o, ';');
+    num(r, o, col + 1);
+    b1(r, o, 'H');
+}
+
+void sgr(inout I64[_] r, inout U8[_] o, I64 style) {
+    if (style == state.S_PLAIN) {
+        put(r, o, b"\x1b[0m");
+    } else {
+        put(r, o, b"\x1b[7m");
+    }
+}
+
+// Writes the frame for `grid` to `o`, setting r[R_OUT_LEN].
+export void frame(inout I64[_] r, in I64[_] grid, inout U8[_] o) {
+    I64 nrows = min(r[state.R_ROWS], state.MAX_ROWS);
+    I64 ncols = min(r[state.R_COLS], state.MAX_COLS);
+    r[state.R_OUT_LEN] = 0;
+    put(r, o, b"\x1b[?25l");
+    U8[4] s;
+    for row in 0..nrows {
+        move(r, o, row, 0);
+        sgr(r, o, state.S_PLAIN);
+        I64 style = state.S_PLAIN;
+        for col in 0..ncols {
+            I64 v = grid[row * ncols + col];
+            I64 st = v / state.STYLE;
+            if ((st == state.S_PLAIN) != (style == state.S_PLAIN)) {
+                sgr(r, o, st);
+            }
+            style = st;
+            I64 w = keys.encode(v % state.STYLE, s);
+            put(r, o, s[0..w]);
+        }
+    }
+    sgr(r, o, state.S_PLAIN);
+    move(r, o, max(r[state.R_CUR_ROW], 0), max(r[state.R_CUR_COL], 0));
+    put(r, o, b"\x1b[?25h");
+}
+
+test "a one-row frame" {
+    I64[64] r;
+    I64[2] grid = ['h', 'i' + state.S_SELECTED * state.STYLE];
+    U8[64] o;
+    r[state.R_ROWS] = 1;
+    r[state.R_COLS] = 2;
+    r[state.R_CUR_ROW] = 0;
+    r[state.R_CUR_COL] = 1;
+    frame(r, grid, o);
+    assert(equal(o[0..r[state.R_OUT_LEN]], b"\x1b[?25l\x1b[1;1H\x1b[0mh\x1b[7mi\x1b[0m\x1b[1;2H\x1b[?25h"));
+    assert(r[state.R_OUT_LEN] == 38);
+}

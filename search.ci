@@ -1,0 +1,254 @@
+// search.ci: the find prompt and the go-to-line prompt (SPEC.md FIND-1 to FIND-3, KEY-8).
+//
+// Search is literal and case-sensitive. It is incremental: each character typed at the `find:`
+// prompt searches again from where the caret was when the prompt opened, so you watch the match
+// move as the word grows. Enter or F3 goes to the next match, Shift+F3 to the previous one, and
+// both wrap around the ends of the file. The search text stays in the `find` table after the
+// prompt closes, so the next Ctrl+F starts with it.
+//
+// Matching is the plain way: try every position. That is fast enough for files a person edits;
+// a smarter algorithm (Boyer-Moore) would slot in behind `match_at` without changing anything else.
+
+import state;
+import buf;
+import cur;
+import keys;
+
+// Whether the search text f[0, n) occurs at text position p.
+Bool match_at(in I64[_] r, in U8[_] t, in U8[_] f, I64 n, I64 p) {
+    if (p + n > buf.length(r, t)) {
+        return false;
+    }
+    for i in 0..n {
+        if (buf.at(r, t, p + i) != f[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The first match at or after `from`, wrapping to the start; -1 when there is none. Sets the
+// wrapped message when the match is found only by wrapping (FIND-2).
+export I64 forward(inout I64[_] r, in U8[_] t, in U8[_] f, I64 from) {
+    I64 n = r[state.R_FIND_LEN];
+    I64 total = buf.length(r, t);
+    if (n == 0) {
+        return -1;
+    }
+    for p in from..total + 1 {
+        if (match_at(r, t, f, n, p)) {
+            return p;
+        }
+    }
+    for p in 0..min(from, total + 1) {
+        if (match_at(r, t, f, n, p)) {
+            r[state.R_MSG] = state.MSG_WRAPPED;
+            return p;
+        }
+    }
+    return -1;
+}
+
+// The last match that starts before `before`, wrapping to the end; -1 when there is none.
+export I64 backward(inout I64[_] r, in U8[_] t, in U8[_] f, I64 before) {
+    I64 n = r[state.R_FIND_LEN];
+    I64 total = buf.length(r, t);
+    if (n == 0) {
+        return -1;
+    }
+    I64 p = before - 1;
+    while (p >= 0) {
+        if (match_at(r, t, f, n, p)) {
+            return p;
+        }
+        p -= 1;
+    }
+    p = total - n;
+    while (p >= before && p >= 0) {
+        if (match_at(r, t, f, n, p)) {
+            r[state.R_MSG] = state.MSG_WRAPPED;
+            return p;
+        }
+        p -= 1;
+    }
+    return -1;
+}
+
+// Selects the match at p, or says `not found` and leaves the selection (FIND-3).
+void show(inout I64[_] r, I64 p) {
+    if (p < 0) {
+        r[state.R_MSG] = state.MSG_NOT_FOUND;
+        return;
+    }
+    r[state.R_ANCHOR] = p;
+    r[state.R_HEAD] = p + r[state.R_FIND_LEN];
+}
+
+// Ctrl+F: opens the prompt, seeded with the last search.
+export void open_find(inout I64[_] r) {
+    r[state.R_MODE] = state.MODE_FIND;
+    r[state.R_ORIGIN] = min(r[state.R_ANCHOR], r[state.R_HEAD]);
+}
+
+// Ctrl+G: opens the line prompt.
+export void open_line(inout I64[_] r) {
+    r[state.R_MODE] = state.MODE_LINE;
+    r[state.R_LINE_NUM] = 0;
+}
+
+// F3 or Shift+F3 outside the prompt: the next or previous match of the last search.
+export void again(inout I64[_] r, in U8[_] t, in U8[_] f, Bool back) {
+    I64 lo = min(r[state.R_ANCHOR], r[state.R_HEAD]);
+    if (back) {
+        show(r, backward(r, t, f, lo));
+    } else {
+        show(r, forward(r, t, f, lo + 1));
+    }
+}
+
+// Moves the caret to the start of line `n`, counted from 1, clamped to the file.
+export void go_line(inout I64[_] r, in U8[_] t, I64 n) {
+    I64 p = 0;
+    I64 k = 1;
+    while (k < n) {
+        I64 e = cur.line_end(r, t, p);
+        if (e == buf.length(r, t)) {
+            break;
+        }
+        p = e + 1;
+        k += 1;
+    }
+    cur.go(r, p, false);
+    r[state.R_GOAL] = -1;
+}
+
+// One key while a prompt is open. Text keys edit the prompt; Enter, F3, Shift+F3 and Esc act.
+export void key(inout I64[_] r, in U8[_] t, inout U8[_] f, I64 k) {
+    if (r[state.R_MODE] == state.MODE_LINE) {
+        if (k >= '0' && k <= '9' && r[state.R_LINE_NUM] < 100000000) {
+            r[state.R_LINE_NUM] = r[state.R_LINE_NUM] * 10 + k - '0';
+        } else if (k == keys.K_BACKSPACE) {
+            r[state.R_LINE_NUM] = r[state.R_LINE_NUM] / 10;
+        } else if (k == keys.K_ENTER) {
+            go_line(r, t, r[state.R_LINE_NUM]);
+            r[state.R_MODE] = state.MODE_EDIT;
+        } else if (k == keys.K_ESC) {
+            r[state.R_MODE] = state.MODE_EDIT;
+        } else {
+            r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+        }
+        return;
+    }
+    I64 n = r[state.R_FIND_LEN];
+    if (k == keys.K_ESC) {
+        r[state.R_MODE] = state.MODE_EDIT;
+        return;
+    }
+    if (k == keys.K_ENTER || k == keys.K_F3) {
+        again(r, t, f, false);
+        return;
+    }
+    if (k == keys.K_F3 + keys.M_SHIFT) {
+        again(r, t, f, true);
+        return;
+    }
+    if (k == keys.K_BACKSPACE) {
+        if (n > 0) {
+            // Back over one code point: drop continuation bytes, then the lead byte.
+            I64 m = n - 1;
+            while (m > 0 && f[m] >= 128 && f[m] < 192) {
+                m -= 1;
+            }
+            r[state.R_FIND_LEN] = m;
+            show(r, forward(r, t, f, r[state.R_ORIGIN]));
+        }
+        return;
+    }
+    if (k >= 32 && k < keys.K_UP) {
+        // A typed character: append its UTF-8 bytes and search again from the origin.
+        U8[4] s;
+        I64 w = keys.encode(k, s);
+        if (n + w > len(f)) {
+            r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+            return;
+        }
+        for i in 0..w {
+            f[n + i] = s[i];
+        }
+        r[state.R_FIND_LEN] = n + w;
+        show(r, forward(r, t, f, r[state.R_ORIGIN]));
+        return;
+    }
+    r[state.R_REQ] = r[state.R_REQ] | state.REQ_BELL;
+}
+
+// Tests on "one two one": matches at 0 and 8.
+void load(inout I64[_] r, inout U8[_] t) {
+    U8[11] s = b"one two one";
+    buf.reset(r, t);
+    assert(buf.insert(r, t, 0, s));
+    cur.go(r, 0, false);
+    r[state.R_FIND_LEN] = 0;
+    r[state.R_MSG] = 0;
+}
+
+test "typing at the prompt searches as it goes" {
+    I64[64] r;
+    U8[32] t;
+    U8[16] f;
+    load(r, t);
+    cur.go(r, 2, false);
+    open_find(r);
+    key(r, t, f, 't');
+    assert(r[state.R_ANCHOR] == 4 && r[state.R_HEAD] == 5);
+    key(r, t, f, 'w');
+    assert(r[state.R_ANCHOR] == 4 && r[state.R_HEAD] == 6);
+    key(r, t, f, keys.K_ESC);
+    assert(r[state.R_MODE] == state.MODE_EDIT);
+    assert(r[state.R_HEAD] == 6);
+}
+
+test "next wraps around and says so" {
+    I64[64] r;
+    U8[32] t;
+    U8[16] f;
+    load(r, t);
+    open_find(r);
+    key(r, t, f, 'o');
+    key(r, t, f, 'n');
+    key(r, t, f, 'e');
+    assert(r[state.R_ANCHOR] == 0);
+    key(r, t, f, keys.K_ENTER);
+    assert(r[state.R_ANCHOR] == 8);
+    key(r, t, f, keys.K_ENTER);
+    assert(r[state.R_ANCHOR] == 0);
+    assert(r[state.R_MSG] == state.MSG_WRAPPED);
+    key(r, t, f, keys.K_F3 + keys.M_SHIFT);
+    assert(r[state.R_ANCHOR] == 8);
+}
+
+test "no match leaves the selection and says not found" {
+    I64[64] r;
+    U8[32] t;
+    U8[16] f;
+    load(r, t);
+    cur.go(r, 3, false);
+    open_find(r);
+    key(r, t, f, 'z');
+    assert(r[state.R_MSG] == state.MSG_NOT_FOUND);
+    assert(r[state.R_HEAD] == 3);
+}
+
+test "go to line, clamped to the file" {
+    I64[64] r;
+    U8[32] t;
+    buf.reset(r, t);
+    U8[5] s = b"a\nb\nc";
+    assert(buf.insert(r, t, 0, s));
+    go_line(r, t, 2);
+    assert(r[state.R_HEAD] == 2);
+    go_line(r, t, 99);
+    assert(r[state.R_HEAD] == 4);
+    go_line(r, t, 0);
+    assert(r[state.R_HEAD] == 0);
+}

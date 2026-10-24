@@ -1,0 +1,308 @@
+// undo.ci: the undo log (SPEC.md UNDO-1 to UNDO-5).
+//
+// Every change to the text is one record: where it happened, the bytes it removed, the bytes it
+// inserted, and the selection before and after. Records belong to numbered groups, and undo and
+// redo act on a whole group, so one keystroke of the user's undoes one command however many
+// records it made. Which changes share a group (a run of typing, say) is edit.ci's decision; this
+// module only keeps the records and plays them backward or forward.
+//
+// Two tables hold the log: `u`, REC I64 values per record, and `ub`, the bytes the records
+// removed and inserted, stored once each in the order the records were made. r[R_U_AT] counts the
+// records applied. Undo steps it back, applying each record's inverse (remove what was inserted,
+// put back what was removed); redo steps it forward. A new change after an undo discards the
+// records past r[R_U_AT], which is why redo stops working once you type.
+
+import state;
+import buf;
+
+// Fields of a record in `u`.
+const I64 F_POS = 0;     // text position of the change
+const I64 F_REM = 1;     // bytes removed there
+const I64 F_INS = 2;     // bytes inserted there
+const I64 F_OFF = 3;     // where its removed bytes, then its inserted bytes, start in `ub`
+const I64 F_GROUP = 4;
+const I64 F_A0 = 5;      // selection before: anchor, head
+const I64 F_H0 = 6;
+const I64 F_A1 = 7;      // selection after
+const I64 F_H1 = 8;
+const I64 REC = 9;
+
+// An empty log, with its saved mark at the start (a freshly loaded file is not modified).
+export void reset(inout I64[_] r) {
+    r[state.R_U_RECS] = 0;
+    r[state.R_U_AT] = 0;
+    r[state.R_U_BYTES] = 0;
+    r[state.R_U_GROUP] = 1;
+    r[state.R_U_SAVED] = 0;
+}
+
+// A fresh group number for the next command.
+export I64 new_group(inout I64[_] r) {
+    I64 g = r[state.R_U_GROUP];
+    r[state.R_U_GROUP] = g + 1;
+    return g;
+}
+
+// The group of the newest applied record, or 0 when nothing is applied. edit.ci uses it to
+// decide whether a keystroke continues the last group (UNDO-2).
+export I64 last_group(in I64[_] r, in I64[_] u) {
+    I64 at = r[state.R_U_AT];
+    if (at == 0) {
+        return 0;
+    }
+    return u[(at - 1) * REC + F_GROUP];
+}
+
+// Drops the oldest group to make room (UNDO-4), moving the rest of the log down.
+void drop_oldest(inout I64[_] r, inout I64[_] u, inout U8[_] ub) {
+    I64 recs = r[state.R_U_RECS];
+    I64 g = u[F_GROUP];
+    I64 k = 0;
+    while (k < recs && u[k * REC + F_GROUP] == g) {
+        k += 1;
+    }
+    I64 b = r[state.R_U_BYTES];
+    if (k < recs) {
+        b = u[k * REC + F_OFF];
+    }
+    for i in 0..(recs - k) * REC {
+        u[i] = u[i + k * REC];
+    }
+    for i in 0..recs - k {
+        u[i * REC + F_OFF] = u[i * REC + F_OFF] - b;
+    }
+    for i in 0..r[state.R_U_BYTES] - b {
+        ub[i] = ub[i + b];
+    }
+    r[state.R_U_RECS] = recs - k;
+    r[state.R_U_AT] = max(r[state.R_U_AT] - k, 0);
+    r[state.R_U_BYTES] = r[state.R_U_BYTES] - b;
+    I64 saved = r[state.R_U_SAVED];
+    if (saved >= 0 && saved < k) {
+        r[state.R_U_SAVED] = -1;
+    } else if (saved >= k) {
+        r[state.R_U_SAVED] = saved - k;
+    }
+}
+
+// Records one change that has just been made to the text. Returns false when the change is
+// larger than the whole log: the log is then empty and the caller says so (UNDO-4).
+export Bool record(inout I64[_] r, inout I64[_] u, inout U8[_] ub, I64 group, I64 pos,
+                   in U8[_] removed, in U8[_] inserted, I64 a0, I64 h0, I64 a1, I64 h1) {
+    // A change after an undo makes the undone records unreachable: discard them.
+    I64 at = r[state.R_U_AT];
+    if (at < r[state.R_U_RECS]) {
+        r[state.R_U_RECS] = at;
+        r[state.R_U_BYTES] = u[at * REC + F_OFF];
+        if (r[state.R_U_SAVED] > at) {
+            r[state.R_U_SAVED] = -1;
+        }
+    }
+    I64 need = len(removed) + len(inserted);
+    while (r[state.R_U_RECS] > 0 && ((r[state.R_U_RECS] + 1) * REC > len(u) || r[state.R_U_BYTES] + need > len(ub))) {
+        drop_oldest(r, u, ub);
+    }
+    if (REC > len(u) || need > len(ub)) {
+        r[state.R_U_SAVED] = -1;
+        return false;
+    }
+    I64 n = r[state.R_U_RECS];
+    I64 off = r[state.R_U_BYTES];
+    for i in 0..len(removed) {
+        ub[off + i] = removed[i];
+    }
+    for i in 0..len(inserted) {
+        ub[off + len(removed) + i] = inserted[i];
+    }
+    I64 base = n * REC;
+    u[base + F_POS] = pos;
+    u[base + F_REM] = len(removed);
+    u[base + F_INS] = len(inserted);
+    u[base + F_OFF] = off;
+    u[base + F_GROUP] = group;
+    u[base + F_A0] = a0;
+    u[base + F_H0] = h0;
+    u[base + F_A1] = a1;
+    u[base + F_H1] = h1;
+    r[state.R_U_RECS] = n + 1;
+    r[state.R_U_AT] = n + 1;
+    r[state.R_U_BYTES] = off + need;
+    return true;
+}
+
+// Undoes the newest applied group: its records' inverses, newest first. Returns false when there
+// is nothing to undo. The selection becomes the one before the group (UNDO-3).
+export Bool undo(inout I64[_] r, in I64[_] u, in U8[_] ub, inout U8[_] t) {
+    I64 at = r[state.R_U_AT];
+    if (at == 0) {
+        return false;
+    }
+    I64 g = u[(at - 1) * REC + F_GROUP];
+    while (at > 0 && u[(at - 1) * REC + F_GROUP] == g) {
+        I64 base = (at - 1) * REC;
+        I64 pos = u[base + F_POS];
+        I64 rem = u[base + F_REM];
+        I64 off = u[base + F_OFF];
+        buf.remove(r, t, pos, u[base + F_INS]);
+        assert(buf.insert(r, t, pos, ub[off..off + rem]));
+        r[state.R_ANCHOR] = u[base + F_A0];
+        r[state.R_HEAD] = u[base + F_H0];
+        at -= 1;
+    }
+    r[state.R_U_AT] = at;
+    return true;
+}
+
+// Applies the next undone group again, oldest record first. Returns false when there is nothing
+// to redo. The selection becomes the one after the group.
+export Bool redo(inout I64[_] r, in I64[_] u, in U8[_] ub, inout U8[_] t) {
+    I64 at = r[state.R_U_AT];
+    I64 recs = r[state.R_U_RECS];
+    if (at == recs) {
+        return false;
+    }
+    I64 g = u[at * REC + F_GROUP];
+    while (at < recs && u[at * REC + F_GROUP] == g) {
+        I64 base = at * REC;
+        I64 pos = u[base + F_POS];
+        I64 rem = u[base + F_REM];
+        I64 off = u[base + F_OFF] + rem;
+        buf.remove(r, t, pos, rem);
+        assert(buf.insert(r, t, pos, ub[off..off + u[base + F_INS]]));
+        r[state.R_ANCHOR] = u[base + F_A1];
+        r[state.R_HEAD] = u[base + F_H1];
+        at += 1;
+    }
+    r[state.R_U_AT] = at;
+    return true;
+}
+
+// The file is modified exactly when the log is not at its saved mark (UNDO-5).
+export Bool modified(in I64[_] r) {
+    return r[state.R_U_AT] != r[state.R_U_SAVED];
+}
+
+export void mark_saved(inout I64[_] r) {
+    r[state.R_U_SAVED] = r[state.R_U_AT];
+}
+
+// Tests. A small editor: `type_at` and `erase_at` change the text and record the change, the
+// way edit.ci will.
+
+void type_at(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, I64 g, I64 p, U8 c) {
+    U8[1] s = [c];
+    U8[0] none;
+    assert(buf.insert(r, t, p, s));
+    assert(record(r, u, ub, g, p, none, s, p, p, p + 1, p + 1));
+}
+
+void erase_at(inout I64[_] r, inout U8[_] t, inout I64[_] u, inout U8[_] ub, I64 g, I64 p) {
+    U8[1] s = [buf.at(r, t, p)];
+    U8[0] none;
+    buf.remove(r, t, p, 1);
+    assert(record(r, u, ub, g, p, s, none, p + 1, p + 1, p, p));
+}
+
+I64 text_is3(in I64[_] r, in U8[_] t, U8 a, U8 b, U8 c) {
+    if (buf.length(r, t) != 3) {
+        return 0;
+    }
+    if (buf.at(r, t, 0) != a || buf.at(r, t, 1) != b || buf.at(r, t, 2) != c) {
+        return 0;
+    }
+    return 1;
+}
+
+test "undo takes back a whole group and redo puts it back" {
+    I64[64] r;
+    U8[16] t;
+    I64[90] u;
+    U8[32] ub;
+    buf.reset(r, t);
+    reset(r);
+    I64 g = new_group(r);
+    type_at(r, t, u, ub, g, 0, 'c');
+    type_at(r, t, u, ub, g, 1, 'a');
+    type_at(r, t, u, ub, g, 2, 't');
+    assert(text_is3(r, t, 'c', 'a', 't') == 1);
+    assert(modified(r));
+    assert(undo(r, u, ub, t));
+    assert(buf.length(r, t) == 0);
+    assert(r[state.R_HEAD] == 0);
+    assert(!modified(r));
+    assert(!undo(r, u, ub, t));
+    assert(redo(r, u, ub, t));
+    assert(text_is3(r, t, 'c', 'a', 't') == 1);
+    assert(r[state.R_HEAD] == 3);
+    assert(!redo(r, u, ub, t));
+}
+
+test "groups undo one at a time, newest first" {
+    I64[64] r;
+    U8[16] t;
+    I64[90] u;
+    U8[32] ub;
+    buf.reset(r, t);
+    reset(r);
+    I64 g1 = new_group(r);
+    type_at(r, t, u, ub, g1, 0, 'a');
+    type_at(r, t, u, ub, g1, 1, 'b');
+    type_at(r, t, u, ub, g1, 2, 'c');
+    I64 g2 = new_group(r);
+    erase_at(r, t, u, ub, g2, 1);
+    assert(buf.length(r, t) == 2);
+    assert(undo(r, u, ub, t));
+    assert(text_is3(r, t, 'a', 'b', 'c') == 1);
+    assert(r[state.R_HEAD] == 2);
+    assert(undo(r, u, ub, t));
+    assert(buf.length(r, t) == 0);
+}
+
+test "typing after an undo discards the redo" {
+    I64[64] r;
+    U8[16] t;
+    I64[90] u;
+    U8[32] ub;
+    buf.reset(r, t);
+    reset(r);
+    type_at(r, t, u, ub, new_group(r), 0, 'x');
+    assert(undo(r, u, ub, t));
+    type_at(r, t, u, ub, new_group(r), 0, 'y');
+    assert(!redo(r, u, ub, t));
+    assert(buf.length(r, t) == 1);
+    assert(buf.at(r, t, 0) == 'y');
+}
+
+test "saving moves the mark, and undoing past it modifies again" {
+    I64[64] r;
+    U8[16] t;
+    I64[90] u;
+    U8[32] ub;
+    buf.reset(r, t);
+    reset(r);
+    type_at(r, t, u, ub, new_group(r), 0, 'a');
+    mark_saved(r);
+    assert(!modified(r));
+    assert(undo(r, u, ub, t));
+    assert(modified(r));
+    assert(redo(r, u, ub, t));
+    assert(!modified(r));
+}
+
+test "a full log drops its oldest group" {
+    I64[64] r;
+    U8[16] t;
+    I64[18] u;
+    U8[32] ub;
+    buf.reset(r, t);
+    reset(r);
+    type_at(r, t, u, ub, new_group(r), 0, 'a');
+    type_at(r, t, u, ub, new_group(r), 1, 'b');
+    type_at(r, t, u, ub, new_group(r), 2, 'c');
+    assert(r[state.R_U_RECS] == 2);
+    assert(undo(r, u, ub, t));
+    assert(undo(r, u, ub, t));
+    assert(!undo(r, u, ub, t));
+    assert(buf.length(r, t) == 1);
+    assert(buf.at(r, t, 0) == 'a');
+}

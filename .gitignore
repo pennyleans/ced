@@ -1,0 +1,7 @@
+# Development-only, kept out of the public tree.
+tests/
+docs/history/
+
+# Python
+__pycache__/
+*.py[cod]

@@ -1,0 +1,299 @@
+// view.ci: the cell grid (SPEC.md VIEW-1 to VIEW-3).
+//
+// The screen is a grid of cells, one code point and one style each. This module fills the grid
+// from the text; term.ci then turns the grid into the bytes a terminal understands. Keeping the
+// two apart means the drawing logic can be tested as plain numbers, and the terminal code never
+// needs to know what a line or a selection is.
+//
+// Layout: every row but the last two shows a line of text, the second-to-last is the status line
+// (file name, [+] when modified, a message, line:col on the right), and the last shows the keys,
+// or the prompt while one is open. Long lines are clipped, and the view scrolls sideways and up
+// and down to keep the caret on screen.
+
+import state;
+import buf;
+import cur;
+import undo;
+import keys;
+
+// Every piece of text ced shows. cintc takes no string literal as a value and no imported
+// module variable, so each is a byte array here, spelled as characters.
+
+I64 rows(in I64[_] r) {
+    return min(r[state.R_ROWS], state.MAX_ROWS);
+}
+
+I64 cols(in I64[_] r) {
+    return min(r[state.R_COLS], state.MAX_COLS);
+}
+
+void cell(inout I64[_] grid, in I64[_] r, I64 row, I64 col, I64 cp, I64 style) {
+    if (col >= 0 && col < cols(r)) {
+        grid[row * cols(r) + col] = cp + style * state.STYLE;
+    }
+}
+
+// Writes s on `row` from `col`; returns the column after it.
+I64 put(inout I64[_] grid, in I64[_] r, I64 row, I64 col, in U8[_] s, I64 style) {
+    for i in 0..len(s) {
+        cell(grid, r, row, col + i, s[i] as I64, style);
+    }
+    return col + len(s);
+}
+
+// The number of decimal digits of v >= 0.
+I64 digits_of(I64 v) {
+    I64 digits = 1;
+    I64 p = 10;
+    while (p <= v) {
+        digits += 1;
+        p *= 10;
+    }
+    return digits;
+}
+
+// Writes the decimal digits of v >= 0 on `row` from `col`; returns the column after them.
+I64 put_num(inout I64[_] grid, in I64[_] r, I64 row, I64 col, I64 v, I64 style) {
+    I64 digits = digits_of(v);
+    I64 x = v;
+    for i in 0..digits {
+        cell(grid, r, row, col + digits - 1 - i, '0' + x % 10, style);
+        x /= 10;
+    }
+    return col + digits;
+}
+
+// The code point at text position q (q on a code point boundary).
+I64 cp_at(in I64[_] r, in U8[_] t, I64 q) {
+    I64 b = buf.at(r, t, q) as I64;
+    if (b < 128) {
+        return b;
+    }
+    I64 k = cur.next_cp(r, t, q) - q;
+    I64 v = b % (128 >> k);
+    for j in 1..k {
+        v = v * 64 + (buf.at(r, t, q + j) as I64) % 64;
+    }
+    return v;
+}
+
+// Scrolls so that the caret's line is on screen and its column is inside the window.
+void scroll(inout I64[_] r, in U8[_] t) {
+    I64 text_rows = max(rows(r) - 2, 1);
+    I64 h = r[state.R_HEAD];
+    I64 hl = cur.line_start(r, t, h);
+    I64 top = cur.line_start(r, t, min(r[state.R_TOP], buf.length(r, t)));
+    if (hl < top) {
+        top = hl;
+    } else {
+        // Count the lines from the top line to the caret's; move the top down while too many.
+        I64 n = 0;
+        I64 p = top;
+        while (p < hl) {
+            p = cur.line_end(r, t, p) + 1;
+            n += 1;
+        }
+        while (n >= text_rows) {
+            top = cur.line_end(r, t, top) + 1;
+            n -= 1;
+        }
+    }
+    r[state.R_TOP] = top;
+    I64 c = cur.column(r, t, h);
+    if (c < r[state.R_LEFT]) {
+        r[state.R_LEFT] = c;
+    } else if (c >= r[state.R_LEFT] + cols(r)) {
+        r[state.R_LEFT] = c - cols(r) + 1;
+    }
+}
+
+// Fills the grid. `name` is the file name, `f` the search text.
+export void render(inout I64[_] r, in U8[_] t, in U8[_] name, in U8[_] f, inout I64[_] grid) {
+    scroll(r, t);
+    I64 nrows = rows(r);
+    I64 ncols = cols(r);
+    for i in 0..nrows * ncols {
+        grid[i] = ' ';
+    }
+    I64 text_rows = max(nrows - 2, 1);
+    I64 lo = min(r[state.R_ANCHOR], r[state.R_HEAD]);
+    I64 hi = max(r[state.R_ANCHOR], r[state.R_HEAD]);
+    I64 h = r[state.R_HEAD];
+    I64 left = r[state.R_LEFT];
+    I64 n = buf.length(r, t);
+    I64 p = r[state.R_TOP];
+    Bool more = true;
+    for row in 0..text_rows {
+        if (!more) {
+            break;
+        }
+        I64 col = 0;
+        I64 q = p;
+        while (q < n && buf.at(r, t, q) != 10) {
+            if (q == h) {
+                r[state.R_CUR_ROW] = row;
+                r[state.R_CUR_COL] = col - left;
+            }
+            I64 style = state.S_PLAIN;
+            if (q >= lo && q < hi) {
+                style = state.S_SELECTED;
+            }
+            I64 c = cp_at(r, t, q);
+            if (c == 9) {
+                I64 next = (col / 4 + 1) * 4;
+                while (col < next) {
+                    cell(grid, r, row, col - left, ' ', style);
+                    col += 1;
+                }
+            } else if (c == 13) {
+                // A CR before an LF is not shown; a lone CR shows as ^M (TEXT-2).
+                if (q + 1 < n && buf.at(r, t, q + 1) == 10) {
+                    q += 1;
+                    continue;
+                }
+                cell(grid, r, row, col - left, '^', style);
+                cell(grid, r, row, col + 1 - left, 'M', style);
+                col += 2;
+            } else {
+                cell(grid, r, row, col - left, c, style);
+                col += 1;
+            }
+            q = cur.next_cp(r, t, q);
+        }
+        if (q == h) {
+            r[state.R_CUR_ROW] = row;
+            r[state.R_CUR_COL] = col - left;
+        }
+        if (q < n) {
+            p = q + 1;
+        } else {
+            more = false;
+        }
+    }
+
+    // The status line.
+    I64 bar = nrows - 2;
+    for c in 0..ncols {
+        cell(grid, r, bar, c, ' ', state.S_BAR);
+    }
+    I64 col = put(grid, r, bar, 1, name[0..r[state.R_NAME_LEN]], state.S_BAR);
+    if (undo.modified(r)) {
+        col = put(grid, r, bar, col, b" [+]", state.S_BAR);
+    } else if (r[state.R_NEW_FILE] == 1) {
+        col = put(grid, r, bar, col, b" (new file)", state.S_BAR);
+    }
+    col += 2;
+    switch (r[state.R_MSG]) {
+        case state.MSG_TOO_BIG: col = put(grid, r, bar, col, b"the text does not fit", state.S_BAR);
+        case state.MSG_HISTORY_CLEARED: col = put(grid, r, bar, col, b"undo history cleared: the edit was too large", state.S_BAR);
+        case state.MSG_SAVED: col = put(grid, r, bar, col, b"saved", state.S_BAR);
+        case state.MSG_SAVE_FAILED: col = put(grid, r, bar, col, b"not saved: the file could not be written", state.S_BAR);
+        case state.MSG_NOT_FOUND: col = put(grid, r, bar, col, b"not found", state.S_BAR);
+        case state.MSG_WRAPPED: col = put(grid, r, bar, col, b"wrapped", state.S_BAR);
+        case state.MSG_QUIT_WARN: col = put(grid, r, bar, col, b"unsaved changes: Ctrl+Q again to quit", state.S_BAR);
+        case state.MSG_NOTHING_TO_UNDO: col = put(grid, r, bar, col, b"nothing to undo", state.S_BAR);
+        case state.MSG_NOTHING_TO_REDO: col = put(grid, r, bar, col, b"nothing to redo", state.S_BAR);
+        default: {}
+    }
+    // line:col on the right, both counted from 1.
+    I64 line = buf.lines_before(r, t, h) + 1;
+    I64 column = cur.column(r, t, h) + 1;
+    I64 width = digits_of(line) + 1 + digits_of(column);
+    I64 at = max(ncols - width - 1, col);
+    at = put_num(grid, r, bar, at, line, state.S_BAR);
+    cell(grid, r, bar, at, ':', state.S_BAR);
+    at = put_num(grid, r, bar, at + 1, column, state.S_BAR);
+
+    // The last row: the keys, or the prompt with the cursor at its end.
+    I64 last = nrows - 1;
+    if (r[state.R_MODE] == state.MODE_FIND) {
+        I64 c = put(grid, r, last, 0, b"find: ", state.S_PLAIN);
+        I64 q = 0;
+        I64[2] k;
+        while (q < r[state.R_FIND_LEN]) {
+            q += keys.decode(f[0..r[state.R_FIND_LEN]], q, k);
+            cell(grid, r, last, c, k[0], state.S_PLAIN);
+            c += 1;
+        }
+        r[state.R_CUR_ROW] = last;
+        r[state.R_CUR_COL] = c;
+    } else if (r[state.R_MODE] == state.MODE_LINE) {
+        I64 c = put(grid, r, last, 0, b"line: ", state.S_PLAIN);
+        if (r[state.R_LINE_NUM] > 0) {
+            c = put_num(grid, r, last, c, r[state.R_LINE_NUM], state.S_PLAIN);
+        }
+        r[state.R_CUR_ROW] = last;
+        r[state.R_CUR_COL] = c;
+    } else {
+        I64 c = put(grid, r, last, 0, b"^S save  ^Q quit  ^F find  ^Z undo  ^Y redo  ^G line", state.S_PLAIN);
+    }
+}
+
+// Tests: a 4-row, 12-column window, so two rows of text.
+
+I64 at_cell(in I64[_] grid, in I64[_] r, I64 row, I64 col) {
+    return grid[row * cols(r) + col];
+}
+
+void setup(inout I64[_] r, inout U8[_] t, in U8[_] s) {
+    buf.reset(r, t);
+    assert(buf.insert(r, t, 0, s));
+    undo.reset(r);
+    r[state.R_ROWS] = 4;
+    r[state.R_COLS] = 12;
+    r[state.R_TOP] = 0;
+    r[state.R_LEFT] = 0;
+    r[state.R_MODE] = state.MODE_EDIT;
+    r[state.R_MSG] = state.MSG_NONE;
+    r[state.R_NAME_LEN] = 0;
+    cur.go(r, 0, false);
+}
+
+test "two lines, the bars and the cursor" {
+    I64[64] r;
+    U8[32] t;
+    U8[16] name;
+    U8[4] f;
+    I64[48] grid;
+    U8[5] s = b"ab\ncd";
+    setup(r, t, s);
+    cur.go(r, 4, false);
+    render(r, t, name, f, grid);
+    assert(at_cell(grid, r, 0, 0) == 'a' && at_cell(grid, r, 0, 1) == 'b');
+    assert(at_cell(grid, r, 1, 0) == 'c' && at_cell(grid, r, 1, 1) == 'd');
+    assert(r[state.R_CUR_ROW] == 1 && r[state.R_CUR_COL] == 1);
+    // line:col 2:2 at the right of the status line, in reverse video.
+    assert(at_cell(grid, r, 2, 10) == '2' + state.S_BAR * state.STYLE);
+    assert(at_cell(grid, r, 3, 0) == '^');
+}
+
+test "the view scrolls down to the caret" {
+    I64[64] r;
+    U8[32] t;
+    U8[16] name;
+    U8[4] f;
+    I64[48] grid;
+    U8[7] s = b"1\n2\n3\n4";
+    setup(r, t, s);
+    cur.doc_end(r, t, false);
+    render(r, t, name, f, grid);
+    assert(at_cell(grid, r, 0, 0) == '3');
+    assert(at_cell(grid, r, 1, 0) == '4');
+    assert(r[state.R_CUR_ROW] == 1);
+}
+
+test "a selection is drawn reversed, a tab as spaces" {
+    I64[64] r;
+    U8[32] t;
+    U8[16] name;
+    U8[4] f;
+    I64[48] grid;
+    U8[3] s = b"\txy";
+    setup(r, t, s);
+    r[state.R_ANCHOR] = 1;
+    r[state.R_HEAD] = 2;
+    render(r, t, name, f, grid);
+    assert(at_cell(grid, r, 0, 0) == ' ' && at_cell(grid, r, 0, 3) == ' ');
+    assert(at_cell(grid, r, 0, 4) == 'x' + state.S_SELECTED * state.STYLE);
+    assert(at_cell(grid, r, 0, 5) == 'y');
+}
