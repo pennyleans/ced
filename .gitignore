@@ -2,6 +2,13 @@
 tests/
 docs/history/
 
+# Packaging, kept here for the future release surface.
+tools/
+.github/
+CONTRIBUTING.md
+RELEASING.md
+VERSION
+
 # Python
 __pycache__/
 *.py[cod]
