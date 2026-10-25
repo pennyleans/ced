@@ -14,4 +14,4 @@ Build once, then run with no flag. The frame arena is baked in at build time, so
 
 ## License
 
-Licensed under either of Apache License 2.0 or MIT, at your option.
+Licensed under Apache-2.0 OR MIT.
