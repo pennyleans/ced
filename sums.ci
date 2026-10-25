@@ -1,0 +1,196 @@
+// sums.ci: parse a SHA256SUMS manifest. Pure: no service calls, no time, no environment.
+//
+// One line is 64 hex digits, one space, a marker (a space or '*'), then the file name,
+// ended by LF. A final CR before the LF is dropped. Anything else is refused, because a
+// manifest the verifier cannot read exactly is a manifest it must not half-believe.
+//
+// Records go into the arrays the caller passes. parse returns number of entries (at
+// least 1) on success, or a negative line number on failure: the 1-based line that did
+// not parse, so the caller can name it without building a string.
+
+export const I64 MAX_ENTRIES = 256;
+
+// The value of one hex digit, -1 when the byte is not one.
+I64 nib(U8 c) {
+    if (c >= 0x30 && c <= 0x39) {
+        return (c - 0x30) as I64;
+    }
+    if (c >= 0x61 && c <= 0x66) {
+        return (c - 0x61 + 10) as I64;
+    }
+    if (c >= 0x41 && c <= 0x46) {
+        return (c - 0x41 + 10) as I64;
+    }
+    return -1;
+}
+
+// A usable file name: one plain segment, not ".", not "..", with no path separator and
+// no NUL. A name with a slash would name a file outside the grant root's flat listing,
+// and a name of "." or ".." names the directory itself, so all three are refused.
+Bool bad_name(in U8[_] buf, I64 off, I64 n) {
+    if (n == 0) {
+        return true;
+    }
+    if (n == 1 && buf[off] == '.') {
+        return true;
+    }
+    if (n == 2 && buf[off] == '.' && buf[off + 1] == '.') {
+        return true;
+    }
+    for i in 0..n {
+        U8 c = buf[off + i];
+        if (c == 0 || c == '/' || c == '\\') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Parse nbytes of manifest into records. dgst holds 32 bytes per entry; off and nlen
+// hold each name's offset into buf and its length. Returns the number of entries, or a negative line.
+export I64 parse[n, d, o, l](in U8[n] buf, I64 nbytes, inout U8[d] dgst, inout I64[o] off, inout I64[l] nlen) {
+    I64 nentries = 0;
+    I64 at = 0;
+    I64 line = 0;
+    while (at < nbytes) {
+        line += 1;
+        I64 e = at;
+        while (e < nbytes && buf[e] != 0x0A) {
+            e += 1;
+        }
+        if (e == nbytes) {
+            return -line;
+        }
+        I64 width = e - at;
+        if (width < 67) {
+            return -line;
+        }
+        if (nentries >= MAX_ENTRIES) {
+            return -line;
+        }
+        for j in 0..32 {
+            I64 hi = nib(buf[at + 2 * j]);
+            I64 lo = nib(buf[at + 2 * j + 1]);
+            if (hi < 0 || lo < 0) {
+                return -line;
+            }
+            dgst[32 * nentries + j] = ((hi << 4) | lo) as U8;
+        }
+        if (buf[at + 64] != 0x20) {
+            return -line;
+        }
+        if (buf[at + 65] != 0x20 && buf[at + 65] != '*') {
+            return -line;
+        }
+        I64 noff = at + 66;
+        I64 nlen0 = e - noff;
+        if (nlen0 > 0 && buf[e - 1] == 0x0D) {
+            nlen0 -= 1;
+        }
+        if (bad_name(buf, noff, nlen0)) {
+            return -line;
+        }
+        for k in 0..nentries {
+            if (nlen[k] == nlen0) {
+                Bool same = true;
+                for q in 0..nlen0 {
+                    if (buf[off[k] + q] != buf[noff + q]) {
+                        same = false;
+                    }
+                }
+                if (same) {
+                    return -line;
+                }
+            }
+        }
+        off[nentries] = noff;
+        nlen[nentries] = nlen0;
+        nentries += 1;
+        at = e + 1;
+    }
+    if (nentries == 0) {
+        return -1;
+    }
+    return nentries;
+}
+
+// ---------------------------------------------------------------- tests
+
+// Scratch for the tests, at module level, like sha256.ci's dig.
+U8[512] tb;
+U8[256] tdg;
+I64[8] toff;
+I64[8] tnlen;
+
+// One well-formed line at tb[at]: 64 hex digits '0' except byte 30, which is 0xab; a
+// space; a marker; the name; and LF. Returns the line's length.
+I64 mkline(I64 at, U8 marker, in U8[_] name) {
+    for j in 0..64 {
+        tb[at + j] = '0';
+    }
+    tb[at + 60] = 'a';
+    tb[at + 61] = 'B';
+    tb[at + 64] = ' ';
+    tb[at + 65] = marker;
+    for j in 0..len(name) {
+        tb[at + 66 + j] = name[j];
+    }
+    tb[at + 66 + len(name)] = '\n';
+    return 67 + len(name);
+}
+
+test "one line parses and its digest decodes" {
+    I64 n = mkline(0, ' ', b"a.txt");
+    I64 r = parse(tb, n, tdg, toff, tnlen);
+    assert(r == 1);
+    assert(tdg[30] == 0xab);
+    assert(tdg[31] == 0);
+    assert(toff[0] == 66);
+    assert(tnlen[0] == 5);
+}
+
+test "uppercase hex and the star marker parse" {
+    I64 n = mkline(0, '*', b"b");
+    I64 r = parse(tb, n, tdg, toff, tnlen);
+    assert(r == 1);
+    assert(tdg[30] == 0xab);
+}
+
+test "a name with a space parses" {
+    I64 n = mkline(0, ' ', b"two words");
+    I64 r = parse(tb, n, tdg, toff, tnlen);
+    assert(r == 1);
+    assert(tnlen[0] == 9);
+}
+
+test "a duplicate name is refused" {
+    I64 a = mkline(0, ' ', b"dup");
+    I64 b = mkline(a, ' ', b"dup");
+    I64 r = parse(tb, a + b, tdg, toff, tnlen);
+    assert(r == -2);
+}
+
+test "a dot-dot name is refused" {
+    I64 n = mkline(0, ' ', b"..");
+    I64 r = parse(tb, n, tdg, toff, tnlen);
+    assert(r == -1);
+}
+
+test "a backslash in a name is refused" {
+    I64 n = mkline(0, ' ', b"a\\b");
+    I64 r = parse(tb, n, tdg, toff, tnlen);
+    assert(r == -1);
+}
+
+test "a line with no newline is refused" {
+    I64 n = mkline(0, ' ', b"x");
+    tb[n - 1] = 'x';   // replace the LF, so the line runs to the end
+    I64 r = parse(tb, n, tdg, toff, tnlen);
+    assert(r == -1);
+}
+
+test "a short line is refused" {
+    I64 n = mkline(0, ' ', b"x");
+    I64 r = parse(tb, 66, tdg, toff, tnlen);   // 66 bytes, shorter than 64 + 2 + 1
+    assert(r == -1);
+}
