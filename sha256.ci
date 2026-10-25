@@ -1,0 +1,267 @@
+// sha256.ci: SHA-256 (FIPS 180-4, sections 4.1.2, 4.2.2, 5.1.1, 5.3.3, 6.2).
+//
+// ced-verify hashes one file at a time, so this is a streaming interface: sha_init,
+// then sha_update any number of times, then sha_final, which writes the 32 digest
+// bytes. A message holds at most 2^60 - 1 bytes, because the bit length is the checked
+// I64 product total * 8.
+//
+// Pure: no service calls, no time, no environment, no randomness. Words are U32 with
+// the wrapping +% and <<% and the logical >>, and every other operation is checked, so
+// a misuse faults instead of hashing wrong. The NIST test vectors below pin the result.
+
+export const I64 SHA_DIGEST_BYTES = 32;
+export const I64 SHA_BLOCK_BYTES = 64;
+
+export struct Sha256 {
+    U32[8] h;
+    U8[64] block;
+    I64 fill;
+    I64 total;
+}
+
+// The compression function on s[0].block (FIPS 180-4 6.2.2).
+void compress(inout Sha256[_] s) {
+    U32[64] w;
+    U32[64] k;
+    k[0] = 0x428a2f98;
+    k[1] = 0x71374491;
+    k[2] = 0xb5c0fbcf;
+    k[3] = 0xe9b5dba5;
+    k[4] = 0x3956c25b;
+    k[5] = 0x59f111f1;
+    k[6] = 0x923f82a4;
+    k[7] = 0xab1c5ed5;
+    k[8] = 0xd807aa98;
+    k[9] = 0x12835b01;
+    k[10] = 0x243185be;
+    k[11] = 0x550c7dc3;
+    k[12] = 0x72be5d74;
+    k[13] = 0x80deb1fe;
+    k[14] = 0x9bdc06a7;
+    k[15] = 0xc19bf174;
+    k[16] = 0xe49b69c1;
+    k[17] = 0xefbe4786;
+    k[18] = 0x0fc19dc6;
+    k[19] = 0x240ca1cc;
+    k[20] = 0x2de92c6f;
+    k[21] = 0x4a7484aa;
+    k[22] = 0x5cb0a9dc;
+    k[23] = 0x76f988da;
+    k[24] = 0x983e5152;
+    k[25] = 0xa831c66d;
+    k[26] = 0xb00327c8;
+    k[27] = 0xbf597fc7;
+    k[28] = 0xc6e00bf3;
+    k[29] = 0xd5a79147;
+    k[30] = 0x06ca6351;
+    k[31] = 0x14292967;
+    k[32] = 0x27b70a85;
+    k[33] = 0x2e1b2138;
+    k[34] = 0x4d2c6dfc;
+    k[35] = 0x53380d13;
+    k[36] = 0x650a7354;
+    k[37] = 0x766a0abb;
+    k[38] = 0x81c2c92e;
+    k[39] = 0x92722c85;
+    k[40] = 0xa2bfe8a1;
+    k[41] = 0xa81a664b;
+    k[42] = 0xc24b8b70;
+    k[43] = 0xc76c51a3;
+    k[44] = 0xd192e819;
+    k[45] = 0xd6990624;
+    k[46] = 0xf40e3585;
+    k[47] = 0x106aa070;
+    k[48] = 0x19a4c116;
+    k[49] = 0x1e376c08;
+    k[50] = 0x2748774c;
+    k[51] = 0x34b0bcb5;
+    k[52] = 0x391c0cb3;
+    k[53] = 0x4ed8aa4a;
+    k[54] = 0x5b9cca4f;
+    k[55] = 0x682e6ff3;
+    k[56] = 0x748f82ee;
+    k[57] = 0x78a5636f;
+    k[58] = 0x84c87814;
+    k[59] = 0x8cc70208;
+    k[60] = 0x90befffa;
+    k[61] = 0xa4506ceb;
+    k[62] = 0xbef9a3f7;
+    k[63] = 0xc67178f2;
+    for t in 0..16 {
+        I64 j = 4 * t;
+        w[t] = ((s[0].block[j] as U32) << 24) | ((s[0].block[j + 1] as U32) << 16)
+            | ((s[0].block[j + 2] as U32) << 8) | (s[0].block[j + 3] as U32);
+    }
+    for t in 16..64 {
+        U32 x = w[t - 15];
+        U32 y = w[t - 2];
+        U32 s0 = ((x >> 7) | (x <<% 25)) ^ ((x >> 18) | (x <<% 14)) ^ (x >> 3);
+        U32 s1 = ((y >> 17) | (y <<% 15)) ^ ((y >> 19) | (y <<% 13)) ^ (y >> 10);
+        w[t] = w[t - 16] +% s0 +% w[t - 7] +% s1;
+    }
+    U32 a = s[0].h[0];
+    U32 b = s[0].h[1];
+    U32 c = s[0].h[2];
+    U32 d = s[0].h[3];
+    U32 e = s[0].h[4];
+    U32 f = s[0].h[5];
+    U32 g = s[0].h[6];
+    U32 h = s[0].h[7];
+    for t in 0..64 {
+        U32 big1 = ((e >> 6) | (e <<% 26)) ^ ((e >> 11) | (e <<% 21)) ^ ((e >> 25) | (e <<% 7));
+        U32 ch = (e & f) ^ (~e & g);
+        U32 t1 = h +% big1 +% ch +% k[t] +% w[t];
+        U32 big0 = ((a >> 2) | (a <<% 30)) ^ ((a >> 13) | (a <<% 19)) ^ ((a >> 22) | (a <<% 10));
+        U32 maj = (a & b) ^ (a & c) ^ (b & c);
+        U32 t2 = big0 +% maj;
+        h = g;
+        g = f;
+        f = e;
+        e = d +% t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 +% t2;
+    }
+    s[0].h[0] = s[0].h[0] +% a;
+    s[0].h[1] = s[0].h[1] +% b;
+    s[0].h[2] = s[0].h[2] +% c;
+    s[0].h[3] = s[0].h[3] +% d;
+    s[0].h[4] = s[0].h[4] +% e;
+    s[0].h[5] = s[0].h[5] +% f;
+    s[0].h[6] = s[0].h[6] +% g;
+    s[0].h[7] = s[0].h[7] +% h;
+}
+
+// The initial hash value H(0) (FIPS 180-4 5.3.3) and an empty message.
+export void sha_init(inout Sha256[_] s) {
+    s[0].h[0] = 0x6a09e667;
+    s[0].h[1] = 0xbb67ae85;
+    s[0].h[2] = 0x3c6ef372;
+    s[0].h[3] = 0xa54ff53a;
+    s[0].h[4] = 0x510e527f;
+    s[0].h[5] = 0x9b05688c;
+    s[0].h[6] = 0x1f83d9ab;
+    s[0].h[7] = 0x5be0cd19;
+    s[0].fill = 0;
+    s[0].total = 0;
+}
+
+// Appends data[start..start + nbytes) to the message.
+export void sha_update[n](inout Sha256[_] s, in U8[n] data, I64 start, I64 nbytes) {
+    for i in start..start + nbytes {
+        s[0].block[s[0].fill] = data[i];
+        s[0].fill += 1;
+        if (s[0].fill == SHA_BLOCK_BYTES) {
+            compress(s);
+            s[0].fill = 0;
+        }
+    }
+    s[0].total += nbytes;
+}
+
+// Pads the message (FIPS 180-4 5.1.1) and writes the digest to digest[0..32).
+export void sha_final[d](inout Sha256[_] s, inout U8[d] digest) {
+    U64 bits = (s[0].total * 8) as U64;
+    s[0].block[s[0].fill] = 0x80;
+    s[0].fill += 1;
+    if (s[0].fill > 56) {
+        while (s[0].fill < SHA_BLOCK_BYTES) {
+            s[0].block[s[0].fill] = 0;
+            s[0].fill += 1;
+        }
+        compress(s);
+        s[0].fill = 0;
+    }
+    while (s[0].fill < 56) {
+        s[0].block[s[0].fill] = 0;
+        s[0].fill += 1;
+    }
+    for i in 0..8 {
+        s[0].block[56 + i] = (bits >> (56 - 8 * i)) as% U8;
+    }
+    compress(s);
+    s[0].fill = 0;
+    for i in 0..8 {
+        U32 v = s[0].h[i];
+        digest[4 * i] = (v >> 24) as% U8;
+        digest[4 * i + 1] = (v >> 16) as% U8;
+        digest[4 * i + 2] = (v >> 8) as% U8;
+        digest[4 * i + 3] = v as% U8;
+    }
+}
+
+// The digest of data[start..start + nbytes), in one call.
+export void sha_digest[n, d](in U8[n] data, I64 start, I64 nbytes, inout U8[d] digest) {
+    Sha256[1] s;
+    sha_init(s);
+    sha_update(s, data, start, nbytes);
+    sha_final(s, digest);
+}
+
+// Bytes 4 * i to 4 * i + 3 of a digest, big-endian, as one U32. Test helper only.
+U32 word(in U8[_] d, I64 i) {
+    U32 v = 0;
+    for k in 0..4 {
+        v = (v << 8) | (d[4 * i + k] as U32);
+    }
+    return v;
+}
+
+// The digest scratch for the tests, at module level rather than a test local: cint
+// 0.2.4 miscompiles sha_final when the digest and the Sha256 state are both frame-arena
+// locals. The empty-message vector (e3b0c44298c1c149...) is checked end to end by
+// verify.ci, whose digest is module level; a test block that hashes an empty message
+// faults under cint 0.2.4, so it is not written here.
+U8[32] dig;
+
+test "abc" {
+    Sha256[1] s;
+    sha_init(s);
+    sha_update(s, b"abc", 0, 3);
+    sha_final(s, dig);
+    assert(word(dig, 0) == 0xba7816bf);
+    assert(word(dig, 1) == 0x8f01cfea);
+    assert(word(dig, 2) == 0x414140de);
+    assert(word(dig, 3) == 0x5dae2223);
+    assert(word(dig, 4) == 0xb00361a3);
+    assert(word(dig, 5) == 0x96177a9c);
+    assert(word(dig, 6) == 0xb410ff61);
+    assert(word(dig, 7) == 0xf20015ad);
+}
+
+test "the 448-bit two-block message" {
+    Sha256[1] s;
+    sha_init(s);
+    sha_update(s, b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 0, 56);
+    sha_final(s, dig);
+    assert(word(dig, 0) == 0x248d6a61);
+    assert(word(dig, 1) == 0xd20638b8);
+    assert(word(dig, 2) == 0xe5c02693);
+    assert(word(dig, 3) == 0x0c3e6039);
+    assert(word(dig, 4) == 0xa33ce459);
+    assert(word(dig, 5) == 0x64ff2167);
+    assert(word(dig, 6) == 0xf6ecedd4);
+    assert(word(dig, 7) == 0x19db06c1);
+}
+
+test "one million a, streamed 64 bytes at a time" {
+    Sha256[1] s;
+    U8[64] buf;
+    sha_init(s);
+    for i in 0..64 {
+        buf[i] = 'a';
+    }
+    for k in 0..15625 {
+        sha_update(s, buf, 0, 64);
+    }
+    sha_final(s, dig);
+    assert(word(dig, 0) == 0xcdc76e5c);
+    assert(word(dig, 1) == 0x9914fb92);
+    assert(word(dig, 2) == 0x81a1c7e2);
+    assert(word(dig, 3) == 0x84d73e67);
+    assert(word(dig, 4) == 0xf1809a48);
+    assert(word(dig, 5) == 0xa497200e);
+    assert(word(dig, 6) == 0x046d39cc);
+    assert(word(dig, 7) == 0xc7112cd0);
+}
